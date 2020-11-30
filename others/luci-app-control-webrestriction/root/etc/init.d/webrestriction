@@ -45,21 +45,25 @@ add_rule(){
 		fi
 		if [ "$enable" == "1" ]; then
 			iptables -t filter -A WEB_RESTRICTION -m mac --mac-source $macaddr -j $action
-			[ "$limit_type" == "blacklist" ] && iptables -t nat -A WEB_RESTRICTION -m mac --mac-source $macaddr -j RETURN		
-			#unset "$macaddr"		
+			if [ "$limit_type" == "blacklist" ]; then
+			 iptables -t nat -I WEB_RESTRICTION -m mac --mac-source $macaddr -j DNAT --to 0.0.0.1
+			fi
+			#unset "$macaddr"
 		fi
 	done
 }
 
 start(){
-	
+
 	! load_config && exit 0
 	[ "`iptables -L FORWARD|grep -c WEB_RESTRICTION`" -gt 0 ] && exit 0;
 	iptables -P FORWARD DROP
 	iptables -t filter -N WEB_RESTRICTION
 	if [ "$limit_type" == "blacklist" ]; then
 		iptables -t nat -N WEB_RESTRICTION
+		iptables -t nat -A WEB_RESTRICTION -j RETURN
 		add_rule DROP
+		for ip in `cat /etc/config/webrestriction_bypass.list`; do iptables -t filter -I WEB_RESTRICTION -d $ip -j RETURN;iptables -t nat -I WEB_RESTRICTION -d $ip -j RETURN;done;
 	else
 		add_rule ACCEPT
 		iptables -t filter -A WEB_RESTRICTION -j DROP

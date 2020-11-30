@@ -10,6 +10,10 @@ LUCI_PKGARCH:=all
 PKG_VERSION:=1.0
 PKG_RELEASE:=5-20200107
 
+define Package/luci-app-control-webrestriction/conffiles
+/etc/config/webrestriction_bypass.list
+endef
+
 include $(TOPDIR)/feeds/luci/luci.mk
 
 # call BuildPackage - OpenWrt buildroot signature

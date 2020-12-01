@@ -63,7 +63,7 @@ start(){
 		iptables -t nat -N WEB_RESTRICTION
 		iptables -t nat -A WEB_RESTRICTION -j RETURN
 		add_rule DROP
-		for ip in `cat /etc/config/webrestriction_bypass.list`; do iptables -t filter -I WEB_RESTRICTION -d $ip -j RETURN;iptables -t nat -I WEB_RESTRICTION -d $ip -j RETURN;done;
+		for ip in $(cat /etc/config/webrestriction_bypass.list|grep -Eo "^[^#].*([0-9]+).*$"|grep -Eo "^[0-9./]+"); do iptables -t filter -I WEB_RESTRICTION -d $ip -j RETURN;iptables -t nat -I WEB_RESTRICTION -d $ip -j RETURN;done;
 	else
 		add_rule ACCEPT
 		iptables -t filter -A WEB_RESTRICTION -j DROP

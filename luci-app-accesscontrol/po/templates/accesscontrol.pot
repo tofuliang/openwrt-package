@@ -1,0 +1,104 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+
+# Used in: overview.js:49
+msgid "Internet Access Schedule Control"
+msgstr ""
+
+# Used in: overview.js:50
+msgid "Control internet access for specific devices based on time schedules and MAC addresses."
+msgstr ""
+
+# Used in: overview.js:57
+msgid "Service Status"
+msgstr ""
+
+# Used in: overview.js:58
+msgid "Checking..."
+msgstr ""
+
+# Used in: overview.js:32
+msgid "Running (IPv4 + IPv6)"
+msgstr ""
+
+# Used in: overview.js:34
+msgid "Running (IPv4 only)"
+msgstr ""
+
+# Used in: overview.js:36
+msgid "Running (IPv6 only)"
+msgstr ""
+
+# Used in: overview.js:38
+msgid "Not running"
+msgstr ""
+
+# Used in: overview.js:61
+msgid "Global Settings"
+msgstr ""
+
+# Used in: overview.js:65, overview.js:80
+msgid "Enable"
+msgstr ""
+
+# Used in: overview.js:69
+msgid "Strict Mode"
+msgstr ""
+
+# Used in: overview.js:72
+msgid "Strict mode provides better blocking but may impact CPU performance"
+msgstr ""
+
+# Used in: overview.js:75
+msgid "Access Control Rules"
+msgstr ""
+
+# Used in: overview.js:85
+msgid "MAC Address"
+msgstr ""
+
+# Used in: overview.js:95
+msgid "Start Time"
+msgstr ""
+
+# Used in: overview.js:105
+msgid "End Time"
+msgstr ""
+
+# Used in: overview.js:101, overview.js:111
+msgid "Invalid time format. Use HH:MM (24-hour format)"
+msgstr ""
+
+# Used in: overview.js:117
+msgid "Monday"
+msgstr ""
+
+# Used in: overview.js:118
+msgid "Tuesday"
+msgstr ""
+
+# Used in: overview.js:119
+msgid "Wednesday"
+msgstr ""
+
+# Used in: overview.js:120
+msgid "Thursday"
+msgstr ""
+
+# Used in: overview.js:121
+msgid "Friday"
+msgstr ""
+
+# Used in: overview.js:122
+msgid "Saturday"
+msgstr ""
+
+# Used in: overview.js:123
+msgid "Sunday"
+msgstr ""
+
+# Used in: menu.d/luci-app-accesscontrol.json
+msgid "Control"
+msgstr ""msgid "Service started but no rules active"
+msgstr ""

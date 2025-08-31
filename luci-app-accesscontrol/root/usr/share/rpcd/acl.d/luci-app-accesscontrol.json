@@ -1,0 +1,15 @@
+{
+	"luci-app-accesscontrol": {
+		"description": "Grant UCI access for luci-app-accesscontrol",
+		"read": {
+			"uci": [ "accesscontrol" ],
+			"file": {
+				"nft list table inet fw4": [ "exec" ],
+				"nft list chain inet fw4 accesscontrol": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "accesscontrol" ]
+		}
+	}
+}

@@ -1,0 +1,14 @@
+#!/bin/bash
+. /lib/functions.sh
+
+uci -q delete firewall.webrestriction
+uci -q set firewall.webrestriction=include
+uci -q set firewall.webrestriction.type=script
+uci -q set firewall.webrestriction.path=/var/etc/webrestriction.include
+[ -n "$(command -v fw4)" ] || uci -q set firewall.webrestriction.reload=1
+uci -q commit firewall
+
+/etc/init.d/uhttpd restart >/dev/null 2>&1
+
+rm -f /tmp/luci-indexcache* >/dev/null 2>&1
+exit 0

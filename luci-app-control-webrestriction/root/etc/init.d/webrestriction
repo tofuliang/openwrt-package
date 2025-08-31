@@ -1,0 +1,253 @@
+#!/bin/sh /etc/rc.common
+#
+# Copyright (C) 2024 OpenWrt.org
+#
+# This is free software, licensed under the GNU General Public License v3.
+# See /LICENSE for more information.
+#
+
+START=99
+STOP=10
+USE_PROCD=1
+
+CONFIG=webrestriction
+
+# Debug switch - set to 1 to enable debug output, 0 to disable
+DEBUG=1
+
+# Debug function
+debug_log() {
+	[ "$DEBUG" = "1" ] && echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2
+}
+
+validate_section_webrestriction() {
+	uci_validate_section webrestriction global "${1}" \
+		'enabled:bool:0' \
+		'limit_type:string:blacklist'
+}
+
+add_rules() {
+	local limit_type="$1"
+	local action="$2"
+	
+	debug_log "Starting add_rules function with limit_type=$limit_type, action=$action"
+	
+	debug_log "Loading config: $CONFIG"
+	config_load "$CONFIG"
+	
+	debug_log "Using config_foreach to process rules"
+	config_foreach process_rule rule "$limit_type" "$action"
+	
+	debug_log "Finished add_rules function"
+}
+
+process_rule() {
+	local section="$1"
+	local limit_type="$2"
+	local action="$3"
+	local enabled macaddr
+	
+	debug_log "Processing rule section: $section"
+	
+	config_get enabled "$section" "enabled" "0"
+	debug_log "Rule $section enabled: $enabled"
+	[ "$enabled" != "1" ] && {
+		debug_log "Rule $section is disabled, skipping"
+		return
+	}
+	
+	config_get macaddr "$section" "macaddr"
+	debug_log "Rule $section - MAC: $macaddr, Type: $limit_type, Action: $action"
+	[ -z "$macaddr" ] && {
+		debug_log "Rule $section missing MAC address, skipping"
+		return
+	}
+	
+	# Convert action to nftables syntax
+	local nft_action
+	case "$action" in
+		"DROP")
+			nft_action="drop"
+			;;
+		"ACCEPT")
+			nft_action="accept"
+			;;
+		*)
+			nft_action="drop"
+			;;
+	esac
+	
+	# Add filter rules
+	debug_log "Adding filter rules for $section (MAC: $macaddr)"
+	nft add rule inet fw4 webrestriction \
+		ether saddr "$macaddr" \
+		counter "$nft_action" \
+		comment "\"WebRestriction: $macaddr ($limit_type)\""
+	
+	debug_log "Added filter rule for $section"
+	
+	# Using pure DROP approach - no NAT manipulation needed
+}
+
+start_service() {
+	local enabled limit_type
+	
+	debug_log "Starting webrestriction service"
+	
+	validate_section_webrestriction global || {
+		debug_log "Validation failed for global section"
+		echo "validation failed"
+		return 1
+	}
+	
+	debug_log "Global section validation passed - enabled: $enabled, limit_type: $limit_type"
+
+	mkdir -p /var/etc
+	cat > "/var/etc/webrestriction.include" <<-EOF
+/etc/init.d/webrestriction start
+EOF
+
+	[ "$enabled" = "1" ] || {
+		debug_log "Service is disabled, exiting"
+		return 0
+	}
+	
+	# Check if already running
+	debug_log "Checking if service is already running"
+	if nft list chain inet fw4 webrestriction >/dev/null 2>&1; then
+		debug_log "Service already running, stopping first to avoid duplicate rules"
+		stop_service
+	fi
+	
+	# Create our independent chains in existing fw4 table
+	debug_log "Creating webrestriction chains in fw4 table"
+	
+	# Ensure fw4 table exists (it should in OpenWrt with firewall4)
+	if ! nft list table inet fw4 >/dev/null 2>&1; then
+		debug_log "fw4 table not found, this may indicate firewall4 is not running"
+		return 1
+	fi
+	
+	# Create our independent chains
+	nft add chain inet fw4 webrestriction 2>/dev/null
+	
+	if [ "$limit_type" = "blacklist" ]; then
+		debug_log "Configuring blacklist mode"
+		
+		debug_log "Adding blacklist rules (nftables native approach - no NAT needed)"
+		add_rules "$limit_type" "DROP"
+		
+		# Add bypass rules for whitelisted IPs
+		if [ -f "/etc/config/webrestriction_bypass.list" ]; then
+			debug_log "Processing bypass list from /etc/config/webrestriction_bypass.list"
+			while IFS= read -r line || [ -n "$line" ]; do
+				# Skip comments and empty lines
+				[ -z "$line" ] || [ "${line#\\#}" != "$line" ] && continue
+				
+				# Remove inline comments and trim whitespace
+				ip_addr=$(echo "$line" | sed 's/#.*//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+				
+				# Skip if empty after processing
+				[ -z "$ip_addr" ] && continue
+				
+				debug_log "Processing bypass entry: $ip_addr"
+				
+				# Unified IPv4/IPv6 processing
+				local ip_type selector
+				
+				# Detect IP address type
+				if echo "$ip_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
+					ip_type="IPv4"
+					selector="ip"
+				elif echo "$ip_addr" | grep -qE '^[0-9a-fA-F:]+(/[0-9]+)?$'; then
+					ip_type="IPv6"
+					selector="ip6"
+				else
+					debug_log "Invalid IP address format, skipping: $ip_addr"
+					continue
+				fi
+				
+				debug_log "Adding unified bypass rule for $ip_type: $ip_addr"
+				
+				# Add unified bypass rules (filter chain)
+				nft insert rule inet fw4 webrestriction \
+					"$selector" daddr "$ip_addr" \
+					counter return \
+					comment "\"WebRestriction Bypass $ip_type: $ip_addr\""
+				
+				# NAT bypass rules removed - not needed with pure DROP approach
+			done < /etc/config/webrestriction_bypass.list
+		else
+			debug_log "No bypass list found at /etc/config/webrestriction_bypass.list"
+		fi
+	else
+		debug_log "Configuring whitelist mode"
+		# Whitelist mode: only allow listed devices
+		debug_log "Adding whitelist rules"
+		add_rules "$limit_type" "ACCEPT"
+		debug_log "Adding default DROP rules for whitelist mode"
+		nft add rule inet fw4 webrestriction counter drop comment "\"WebRestriction Default Drop\""
+	fi
+	
+	# 修复：检查是否已经存在跳转规则，避免重复添加，使用 insert 确保优先级
+	debug_log "Checking if jump rule already exists in forward chain"
+	if ! nft list chain inet fw4 forward 2>/dev/null | grep -q "WebRestriction Forward"; then
+		debug_log "Inserting jump rule to forward chain (high priority)"
+		nft insert rule inet fw4 forward \
+			counter jump webrestriction \
+			comment "\"WebRestriction Forward\""
+	else
+		debug_log "Jump rule already exists, skipping"
+	fi
+	
+	# NAT integration removed - using pure DROP approach in FORWARD chain
+	
+	debug_log "Starting procd instance"
+	procd_open_instance
+	procd_set_param command /bin/true
+	procd_set_param respawn
+	procd_close_instance
+	
+	debug_log "Webrestriction service started successfully"
+}
+
+stop_service() {
+	debug_log "Stopping webrestriction service"
+	
+	# 改进的清理逻辑：先删除跳转规则，再清理链
+	debug_log "Removing WebRestriction jump rules from forward chain"
+	
+	# 使用更可靠的方法删除规则
+	nft -a list chain inet fw4 forward 2>/dev/null | grep "WebRestriction Forward" | while read -r line; do
+		handle=$(echo "$line" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+		if [ -n "$handle" ]; then
+			debug_log "Removing forward chain rule handle $handle"
+			nft delete rule inet fw4 forward handle "$handle" 2>/dev/null
+		fi
+	done
+	
+	# NAT rule cleanup removed - not needed with pure DROP approach
+	
+	# Clean up our independent chains
+	if nft list chain inet fw4 webrestriction >/dev/null 2>&1; then
+		debug_log "Removing webrestriction chain"
+		nft flush chain inet fw4 webrestriction 2>/dev/null
+		nft delete chain inet fw4 webrestriction 2>/dev/null
+	fi
+	
+	# NAT chain cleanup removed - not needed with pure DROP approach
+	
+	debug_log "Webrestriction service stopped successfully"
+}
+
+reload_service() {
+	debug_log "Reloading webrestriction service"
+	stop_service
+	start_service
+}
+
+service_triggers() {
+	debug_log "Setting up service triggers"
+	procd_add_reload_trigger "webrestriction"
+	debug_log "Service triggers configured"
+}

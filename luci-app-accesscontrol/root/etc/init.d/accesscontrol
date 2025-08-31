@@ -1,0 +1,377 @@
+#!/bin/sh /etc/rc.common
+#
+# Copyright (C) 2024 OpenWrt.org
+#
+# This is free software, licensed under the GNU General Public License v3.
+# See /LICENSE for more information.
+#
+
+START=99
+STOP=10
+USE_PROCD=1
+
+CONFIG=accesscontrol
+
+# Debug switch - set to 1 to enable debug output, 0 to disable
+DEBUG=1
+
+# Debug function
+debug_log() {
+	[ "$DEBUG" = "1" ] && echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2
+}
+
+# 获取系统UTC偏移（小时数）
+get_utc_offset_hours() {
+	local offset=$(date +%z)  # 格式如: +0800, -0500
+	local sign=${offset:0:1}
+	local hours=${offset:1:2}
+	
+	# 移除前导零避免八进制解释
+	hours=$(echo "$hours" | sed 's/^0*//')
+	[ -z "$hours" ] && hours=0
+	
+	if [ "$sign" = "-" ]; then
+		echo "-$hours"
+	else
+		echo "$hours"
+	fi
+}
+
+# 将本地时间转换为UTC时间
+convert_local_to_utc() {
+	local local_time="$1"  # 格式: HH:MM
+	local offset_hours=$(get_utc_offset_hours)
+	
+	local hour=$(echo "$local_time" | cut -d: -f1)
+	local min=$(echo "$local_time" | cut -d: -f2)
+	
+	# 移除前导零
+	hour=$(echo "$hour" | sed 's/^0*//')
+	min=$(echo "$min" | sed 's/^0*//')
+	[ -z "$hour" ] && hour=0
+	[ -z "$min" ] && min=0
+	
+	# 转换为UTC时间
+	local utc_hour=$((hour - offset_hours))
+	
+	# 处理跨日情况
+	local day_offset=0
+	if [ "$utc_hour" -lt 0 ]; then
+		utc_hour=$((utc_hour + 24))
+		day_offset=-1
+	elif [ "$utc_hour" -ge 24 ]; then
+		utc_hour=$((utc_hour - 24))
+		day_offset=1
+	fi
+	
+	printf "%02d:%02d:%d" "$utc_hour" "$min" "$day_offset"
+}
+
+# 调整星期几（考虑日期偏移）
+adjust_weekdays_for_day_offset() {
+	local weekdays="$1"
+	local day_offset="$2"
+	
+	if [ "$day_offset" = "0" ]; then
+		echo "$weekdays"
+		return
+	fi
+	
+	# 星期几映射
+	local days="Sunday Monday Tuesday Wednesday Thursday Friday Saturday"
+	local adjusted=""
+	
+	# 处理输入的weekdays字符串（可能包含逗号）
+	local weekdays_clean=$(echo "$weekdays" | sed 's/,/ /g')
+	
+	for day in $weekdays_clean; do
+		# 找到当前星期几的位置
+		local pos=0
+		for d in $days; do
+			if [ "$d" = "$day" ]; then
+				break
+			fi
+			pos=$((pos + 1))
+		done
+		
+		# 根据日期偏移调整
+		local new_pos=$((pos + day_offset))
+		if [ "$new_pos" -lt 0 ]; then
+			new_pos=$((new_pos + 7))
+		elif [ "$new_pos" -ge 7 ]; then
+			new_pos=$((new_pos - 7))
+		fi
+		
+		# 获取调整后的星期几
+		local count=0
+		for d in $days; do
+			if [ "$count" = "$new_pos" ]; then
+				if [ -z "$adjusted" ]; then
+					adjusted="$d"
+				else
+					adjusted="$adjusted,$d"
+				fi
+				break
+			fi
+			count=$((count + 1))
+		done
+	done
+	
+	echo "$adjusted"
+}
+
+
+
+add_rules() {
+	debug_log "Starting add_rules function"
+	
+	debug_log "Loading config: $CONFIG"
+	config_load "$CONFIG"
+	
+	debug_log "Using config_foreach to process rules"
+	config_foreach process_rule rule
+	
+	debug_log "Finished add_rules function"
+}
+
+process_rule() {
+	local section="$1"
+	local enabled macaddr start_time end_time
+	local monday tuesday wednesday thursday friday saturday sunday
+	local weekdays=""
+	
+	debug_log "Processing rule section: $section"
+	
+	config_get enabled "$section" "enabled" "0"
+	debug_log "Rule $section enabled: $enabled"
+
+	config_get macaddr "$section" "macaddr"
+	debug_log "Rule $section macaddr: $macaddr"
+
+	[ "$enabled" != "1" ] && {
+		debug_log "Rule $section is disabled, skipping"
+		return
+	}
+	
+	config_get macaddr "$section" "macaddr"
+	config_get start_time "$section" "start_time"
+	config_get end_time "$section" "end_time"
+	
+	debug_log "Rule $section - MAC: $macaddr, Start: $start_time, End: $end_time"
+	
+	[ -z "$macaddr" ] || [ -z "$start_time" ] || [ -z "$end_time" ] && {
+		debug_log "Rule $section missing required parameters, skipping"
+		return
+	}
+	
+	config_get monday "$section" "monday" "1"
+	config_get tuesday "$section" "tuesday" "1"
+	config_get wednesday "$section" "wednesday" "1"
+	config_get thursday "$section" "thursday" "1"
+	config_get friday "$section" "friday" "1"
+	config_get saturday "$section" "saturday" "1"
+	config_get sunday "$section" "sunday" "1"
+	
+	[ "$monday" = "1" ] && weekdays="${weekdays}Monday,"
+	[ "$tuesday" = "1" ] && weekdays="${weekdays}Tuesday,"
+	[ "$wednesday" = "1" ] && weekdays="${weekdays}Wednesday,"
+	[ "$thursday" = "1" ] && weekdays="${weekdays}Thursday,"
+	[ "$friday" = "1" ] && weekdays="${weekdays}Friday,"
+	[ "$saturday" = "1" ] && weekdays="${weekdays}Saturday,"
+	[ "$sunday" = "1" ] && weekdays="${weekdays}Sunday"
+	
+	weekdays=$(echo "$weekdays" | sed 's/,$//')
+	
+	debug_log "Rule $section weekdays: $weekdays"
+	
+	if [ -n "$weekdays" ]; then
+		debug_log "Adding nftables rules for $section (MAC: $macaddr, Time: $start_time-$end_time, Days: $weekdays)"
+		
+		# 将本地时间转换为UTC时间
+		local start_result=$(convert_local_to_utc "$start_time")
+		local end_result=$(convert_local_to_utc "$end_time")
+		
+		local start_utc_time=$(echo "$start_result" | cut -d: -f1,2)
+		local start_day_offset=$(echo "$start_result" | cut -d: -f3)
+		local end_utc_time=$(echo "$end_result" | cut -d: -f1,2)
+		local end_day_offset=$(echo "$end_result" | cut -d: -f3)
+		
+		debug_log "Time conversion - Local: $start_time-$end_time -> UTC: $start_utc_time-$end_utc_time"
+		debug_log "Day offsets - Start: $start_day_offset, End: $end_day_offset"
+		
+		# 检查UTC时间是否跨日（需要拆分规则）
+		local start_hour=$(echo "$start_utc_time" | cut -d: -f1 | sed 's/^0*//')
+		local end_hour=$(echo "$end_utc_time" | cut -d: -f1 | sed 's/^0*//')
+		local start_min=$(echo "$start_utc_time" | cut -d: -f2 | sed 's/^0*//')
+		local end_min=$(echo "$end_utc_time" | cut -d: -f2 | sed 's/^0*//')
+		[ -z "$start_hour" ] && start_hour=0
+		[ -z "$end_hour" ] && end_hour=0
+		[ -z "$start_min" ] && start_min=0
+		[ -z "$end_min" ] && end_min=0
+		
+		# 使用UTC时间添加nftables规则
+		if [ "$start_hour" -gt "$end_hour" ] || 
+		   ([ "$start_hour" -eq "$end_hour" ] && [ "$start_min" -gt "$end_min" ]); then
+			debug_log "UTC cross-midnight time range detected, splitting into two rules"
+			
+			# 规则1: 从start_utc_time到23:59
+			# 调整开始时间对应的星期几
+			local start_weekdays="$weekdays"
+			# if [ "$start_day_offset" != "0" ]; then
+			# 	start_weekdays=$(adjust_weekdays_for_day_offset "$weekdays" "$start_day_offset")
+			# fi
+			local nft_start_weekdays="{ $start_weekdays }"
+			
+			debug_log "Rule 1 (UTC) - Time: $start_utc_time-23:59, Days: $start_weekdays"
+			TZ=UTC nft add rule inet fw4 accesscontrol \
+				ether saddr "$macaddr" \
+				meta hour \"$start_utc_time\"-\"23:59\" meta day $nft_start_weekdays \
+				counter drop \
+				comment \"AccessControl $macaddr evening\"
+			
+			# 规则2: 从00:00到end_utc_time
+			# 调整结束时间对应的星期几
+			local end_weekdays="$weekdays"
+			# if [ "$end_day_offset" != "0" ]; then
+			# 	end_weekdays=$(adjust_weekdays_for_day_offset "$weekdays" "$end_day_offset")
+			# fi
+			local nft_end_weekdays="{ $end_weekdays }"
+			
+			debug_log "Rule 2 (UTC) - Time: 00:00-$end_utc_time, Days: $end_weekdays"
+			TZ=UTC nft add rule inet fw4 accesscontrol \
+				ether saddr "$macaddr" \
+				meta hour \"00:00\"-\"$end_utc_time\" meta day $nft_end_weekdays \
+				counter drop \
+				comment \"AccessControl $macaddr morning\"
+		else
+			# 正常UTC时间范围，单条规则
+			# 调整星期几（如果有日期偏移）
+			local adjusted_weekdays="$weekdays"
+			# if [ "$start_day_offset" != "0" ] || [ "$end_day_offset" != "0" ]; then
+			# 	# 选择合适的日期偏移（优先使用开始时间的偏移）
+			# 	local offset="$start_day_offset"
+			# 	[ "$offset" = "0" ] && offset="$end_day_offset"
+			# 	if [ "$offset" != "0" ]; then
+			# 		adjusted_weekdays=$(adjust_weekdays_for_day_offset "$weekdays" "$offset")
+			# 	fi
+			# fi
+			local nft_weekdays="{ $adjusted_weekdays }"
+			
+			debug_log "Normal UTC time range, single rule: $start_utc_time-$end_utc_time, Days: $adjusted_weekdays"
+			TZ=UTC nft add rule inet fw4 accesscontrol \
+				ether saddr "$macaddr" \
+				meta hour \"$start_utc_time\"-\"$end_utc_time\" meta day $nft_weekdays \
+				counter drop \
+				comment \"AccessControl $macaddr\"
+		fi
+		
+		debug_log "Added nftables rule(s) for $section"
+	else
+		debug_log "No weekdays selected for rule $section, skipping"
+	fi
+}
+
+validate_section_accesscontrol() {
+	uci_validate_section accesscontrol global "${1}" \
+		'enabled:bool:0'
+}
+
+start_service() {
+	local enabled
+	
+	debug_log "Starting accesscontrol service"
+	
+	validate_section_accesscontrol global || {
+		debug_log "Validation failed for global section"
+		echo "validation failed"
+		return 1
+	}
+	
+	debug_log "Global section validation passed - enabled: $enabled"
+	
+	mkdir -p /var/etc
+	cat > "/var/etc/accesscontrol.include" <<-EOF
+/etc/init.d/accesscontrol start
+EOF
+
+	[ "$enabled" = "1" ] || {
+		debug_log "Service is disabled, exiting"
+		return 0
+	}
+	
+	# Create our independent chains in existing fw4 table
+	debug_log "Creating access control chains in fw4 table"
+	
+	# Ensure fw4 table exists (it should in OpenWrt with firewall4)
+	if ! nft list table inet fw4 >/dev/null 2>&1; then
+		debug_log "fw4 table not found, this may indicate firewall4 is not running"
+		return 1
+	fi
+	
+	# Check if already running and clean up first
+	debug_log "Checking if service is already running"
+	if nft list chain inet fw4 accesscontrol >/dev/null 2>&1; then
+		debug_log "Service already running, stopping first to avoid duplicate rules"
+		stop_service
+	fi
+	
+	# Create our independent access_control chain
+	nft add chain inet fw4 accesscontrol 2>/dev/null
+	
+	# Add forward chain integration - this is all we need for access control
+	debug_log "Adding forward chain integration"
+	if ! nft list chain inet fw4 forward 2>/dev/null | grep -q "AccessControl Forward"; then
+		nft insert rule inet fw4 forward \
+			counter jump accesscontrol \
+			comment \"AccessControl Forward\"
+	else
+		debug_log "Forward chain integration already exists, skipping"
+	fi
+	
+	# Load and apply rules
+	debug_log "Loading and applying access control rules"
+	add_rules
+	
+	debug_log "Starting procd instance"
+	procd_open_instance
+	procd_set_param command /bin/true
+	procd_set_param respawn
+	procd_close_instance
+	
+	debug_log "Accesscontrol service started successfully"
+}
+
+stop_service() {
+	debug_log "Stopping accesscontrol service"
+	
+	# Remove AccessControl rules from forward chain
+	debug_log "Removing AccessControl rules from forward chain"
+	nft -a list chain inet fw4 forward 2>/dev/null | grep "AccessControl Forward" | while read -r line; do
+		handle=$(echo "$line" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+		if [ -n "$handle" ]; then
+			debug_log "Removing forward chain rule handle $handle"
+			nft delete rule inet fw4 forward handle "$handle" 2>/dev/null
+		fi
+	done
+	
+	# Clean up our independent chain
+	if nft list chain inet fw4 accesscontrol >/dev/null 2>&1; then
+		debug_log "Removing accesscontrol chain"
+		nft flush chain inet fw4 accesscontrol 2>/dev/null
+		nft delete chain inet fw4 accesscontrol 2>/dev/null
+	fi
+	
+	debug_log "Accesscontrol service stopped successfully"
+}
+
+reload_service() {
+	debug_log "Reloading accesscontrol service"
+	stop_service
+	start_service
+}
+
+service_triggers() {
+	debug_log "Setting up service triggers"
+	procd_add_reload_trigger "accesscontrol"
+	debug_log "Service triggers configured"
+}

@@ -1,0 +1,14 @@
+#!/bin/bash
+. /lib/functions.sh
+
+uci -q delete firewall.accesscontrol
+uci -q set firewall.accesscontrol=include
+uci -q set firewall.accesscontrol.type=script
+uci -q set firewall.accesscontrol.path=/var/etc/accesscontrol.include
+[ -n "$(command -v fw4)" ] || uci -q set firewall.accesscontrol.reload=1
+uci -q commit firewall
+
+/etc/init.d/uhttpd restart >/dev/null 2>&1
+
+rm -f /tmp/luci-indexcache* >/dev/null 2>&1
+exit 0

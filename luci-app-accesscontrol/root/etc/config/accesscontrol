@@ -1,0 +1,15 @@
+config global 'global'
+	option enabled '0'
+
+config rule
+	option enabled '1'
+	option macaddr '00:11:22:33:44:55'
+	option start_time '22:00'
+	option end_time '06:00'
+	option monday '1'
+	option tuesday '1'
+	option wednesday '1'
+	option thursday '1'
+	option friday '1'
+	option saturday '0'
+	option sunday '0'

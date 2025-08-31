@@ -1,0 +1,102 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+# Used in: overview.js:49
+msgid "Internet Access Schedule Control"
+msgstr "上网时间控制"
+
+# Used in: overview.js:50
+msgid "Control internet access for specific devices based on time schedules and MAC addresses."
+msgstr "基于时间计划和MAC地址控制特定设备的互联网访问"
+
+# Used in: overview.js:57
+msgid "Service Status"
+msgstr "服务状态"
+
+# Used in: overview.js:58
+msgid "Checking..."
+msgstr "检查中..."
+
+# Used in: overview.js:32
+msgid "Running (IPv4 + IPv6)"
+msgstr "运行中 (IPv4 + IPv6)"
+
+# Used in: overview.js:34
+msgid "Running (IPv4 only)"
+msgstr "运行中 (仅IPv4)"
+
+# Used in: overview.js:36
+msgid "Running (IPv6 only)"
+msgstr "运行中 (仅IPv6)"
+
+# Used in: overview.js:38
+msgid "Not running"
+msgstr "未运行"
+
+# Used in: overview.js:61
+msgid "Global Settings"
+msgstr "全局设置"
+
+# Used in: overview.js:65, overview.js:80
+msgid "Enable"
+msgstr "启用"
+
+# Used in: overview.js:69
+msgid "Strict Mode"
+msgstr "严格模式"
+
+# Used in: overview.js:72
+msgid "Strict mode provides better blocking but may impact CPU performance"
+msgstr "严格模式提供更好的阻断效果，但可能影响CPU性能"
+
+# Used in: overview.js:75
+msgid "Access Control Rules"
+msgstr "客户端规则"
+
+# Used in: overview.js:85
+msgid "MAC Address"
+msgstr "MAC地址(主机名)"
+
+# Used in: overview.js:95
+msgid "Start Time"
+msgstr "开始时间"
+
+# Used in: overview.js:105
+msgid "End Time"
+msgstr "结束时间"
+
+# Used in: overview.js:101, overview.js:111
+msgid "Invalid time format. Use HH:MM (24-hour format)"
+msgstr "时间格式无效。请使用 HH:MM (24小时制)"
+
+# Used in: overview.js:117
+msgid "Monday"
+msgstr "周一"
+
+# Used in: overview.js:118
+msgid "Tuesday"
+msgstr "周二"
+
+# Used in: overview.js:119
+msgid "Wednesday"
+msgstr "周三"
+
+# Used in: overview.js:120
+msgid "Thursday"
+msgstr "周四"
+
+# Used in: overview.js:121
+msgid "Friday"
+msgstr "周五"
+
+# Used in: overview.js:122
+msgid "Saturday"
+msgstr "周六"
+
+# Used in: overview.js:123
+msgid "Sunday"
+msgstr "周日"
+
+# Used in: menu.d/luci-app-accesscontrol.json
+msgid "Control"
+msgstr "控制"

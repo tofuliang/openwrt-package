@@ -1,0 +1,105 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+# Used in: menu.d/luci-app-webrestriction.json
+msgid "Web Restriction"
+msgstr ""
+
+# Used in: overview.js:52
+msgid "Web Access Restriction"
+msgstr ""
+
+# Used in: overview.js:53
+msgid "Control internet access using whitelist or blacklist mode for specific devices."
+msgstr ""
+
+# Used in: overview.js:60
+msgid "Service Status"
+msgstr ""
+
+# Used in: overview.js:61
+msgid "Checking..."
+msgstr ""
+
+# Used in: overview.js:34
+msgid "Running (IPv4 + IPv6)"
+msgstr ""
+
+# Used in: overview.js:36
+msgid "Running (IPv4 only)"
+msgstr ""
+
+# Used in: overview.js:38
+msgid "Running (IPv6 only)"
+msgstr ""
+
+# Used in: overview.js:40
+msgid "Not running"
+msgstr ""
+
+# Used in: overview.js:64
+msgid "Global Settings"
+msgstr ""
+
+# Used in: overview.js:68, overview.js:100
+msgid "Enable"
+msgstr ""
+
+# Used in: overview.js:72
+msgid "Restriction Mode"
+msgstr ""
+
+# Used in: overview.js:73
+msgid "Blacklist Mode"
+msgstr ""
+
+# Used in: overview.js:74
+msgid "Whitelist Mode"
+msgstr ""
+
+# Used in: overview.js:77
+msgid "Blacklist: Block listed devices. Whitelist: Only allow listed devices."
+msgstr ""
+
+# Used in: overview.js:84, overview.js:85
+msgid "IP Whitelist"
+msgstr ""
+
+# Used in: overview.js:86
+msgid "Enter IP addresses or networks that should always be allowed (one per line). Supports IPv4 and IPv6."
+msgstr ""
+
+# Used in: overview.js:95
+msgid "Device Rules"
+msgstr ""
+
+# Used in: overview.js:105
+msgid "Device Name"
+msgstr ""
+
+# Used in: overview.js:107
+msgid "Enter device name"
+msgstr ""
+
+# Used in: overview.js:109
+msgid "MAC Address"
+msgstr ""
+
+msgid "Basic Settings"
+msgstr ""
+
+msgid "Blacklist"
+msgstr ""
+
+msgid "Whitelist"
+msgstr ""
+
+msgid "Device List Settings"
+msgstr ""
+
+msgid "Configure device blacklist or whitelist based on the restriction mode above."
+msgstr ""
+
+# Used in: menu.d/luci-app-webrestriction.json
+msgid "Control"
+msgstr ""

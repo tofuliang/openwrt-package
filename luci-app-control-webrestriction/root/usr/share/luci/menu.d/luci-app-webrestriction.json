@@ -1,0 +1,21 @@
+{
+	"admin/control": {
+		"title": "Control",
+		"order": 44,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/control/webrestriction": {
+		"title": "Web Restriction",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "webrestriction/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-webrestriction" ],
+			"uci": { "webrestriction": true }
+		}
+	}
+}

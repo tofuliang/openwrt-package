@@ -1,0 +1,21 @@
+{
+	"admin/control": {
+		"title": "Control",
+		"order": 44,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/control/accesscontrol": {
+		"title": "Internet Access Schedule Control",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "accesscontrol/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-accesscontrol" ],
+			"uci": { "accesscontrol": true }
+		}
+	}
+}

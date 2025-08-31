@@ -1,0 +1,26 @@
+{
+	"luci-app-webrestriction": {
+		"description": "Grant UCI access for luci-app-webrestriction",
+		"read": {
+			"uci": [ "webrestriction" ],
+			"ubus": {
+				"service": [ "list" ],
+				"network.interface": [ "dump" ]
+			},
+			"file": {
+				"/etc/config/webrestriction_bypass.list": [ "read" ],
+				"nft list table inet fw4": [ "exec" ],
+				"nft list chain inet fw4 webrestriction": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "webrestriction" ],
+			"ubus": {
+				"service": [ "reload" ]
+			},
+			"file": {
+				"/etc/config/webrestriction_bypass.list": [ "write" ]
+			}
+		}
+	}
+}

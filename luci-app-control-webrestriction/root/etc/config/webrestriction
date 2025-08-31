@@ -1,0 +1,5 @@
+
+config global 'global'
+	option enabled '0'
+	option limit_type 'blacklist'
+

@@ -1,0 +1,121 @@
+# Multi-WAN NFTables Rules
+# This file ensures idempotent loading
+
+add table inet multiwan
+flush table inet multiwan
+
+# 创建新表
+table inet multiwan {
+    # 私有网络地址集合
+    set localnetwork {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 0.0.0.0/8,
+        10.0.0.0/8, 100.64.0.0/10,
+        127.0.0.0/8,
+        169.254.0.0/16, 172.16.0.0/12,
+        192.168.0.0/16, 224.0.0.0/3 }
+    }
+
+    # IPTV目标IP集合 (动态)
+    set iptv {
+        type ipv4_addr
+        flags dynamic
+        elements = { 183.59.57.50, 183.59.59.26 }
+    }
+
+    # 不参与负载均衡的来源IP集合
+    set no_balanced_src {
+        type ipv4_addr
+        flags dynamic
+        elements = { 192.168.2.118 }
+    }
+
+
+    # 不参与负载均衡的目标IP集合
+    set no_balanced {
+        type ipv4_addr
+        flags dynamic
+        timeout 10m
+    }
+
+    # PREROUTING钩子 - 处理转发流量
+    chain prerouting_hook {
+        type filter hook prerouting priority dstnat + 5; policy accept;
+
+        meta nfproto ipv6 counter return
+
+        # --- 1. 跳过无需处理的流量 ---
+        # 目标是路由器本身
+        fib daddr type local counter return
+
+        # 本地环回接口
+        iifname { "lo", "apifox", "WG0" } counter return
+
+        # 目标是内网地址
+        ip daddr @localnetwork counter return
+
+        # 安全检测
+        meta mark != 0 ip saddr @localnetwork iifname != "lo" counter drop
+
+        # 已有连接标记的流量
+        ct state established,related meta mark set ct mark return
+
+        # --- 2. 策略路由 (最高优先级) ---
+        # TVBOX设备强制走IPTV
+        ip saddr 192.168.2.119 counter meta mark set 0x300 goto save_mark
+
+        # RTSP协议(554端口)走IPTV，并将目标IP加入IPTV集合
+        tcp dport 554 counter meta mark set 0x300 add @iptv { ip daddr } goto save_mark
+
+        # IPTV集合中的IP走IPTV
+        ip daddr @iptv counter meta mark set 0x300 goto save_mark
+
+        # 不参与负载均衡的目标走VWAN
+        ip daddr @no_balanced counter meta mark set 0x100 goto save_mark
+
+        # 不参与负载均衡的来源走WAN
+        ip saddr @no_balanced_src counter meta mark set 0x100 goto save_mark
+
+        # --- 3. 负载均衡 (默认规则) ---
+        # 使用五元组hash进行负载均衡，模拟RouterOS PCC
+        counter ct state new meta mark set jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 2 map { 0 : 0x100, 1 : 0x200 } goto save_mark
+    }
+
+    # OUTPUT钩子 - 处理路由器自身发出的流量
+    chain output_hook {
+        type route hook output priority mangle - 5; policy accept;
+
+        meta nfproto ipv6 counter return
+	meta l4proto icmp counter return
+
+        # 已有连接标记的流量
+        ct state established,related meta mark set ct mark return
+
+        # --- 1. 跳过无需处理的流量 ---
+        # 本地环回接口
+        oifname { "lo", "apifox", "WG0" } counter return
+
+        # 目标是内网地址
+        ip daddr @localnetwork counter return
+
+        # --- 2. 负载均衡 (路由器自身发出的流量) ---
+        # 使用五元组hash进行负载均衡
+        counter ct state new meta mark set jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 2 map { 0 : 0x100, 1 : 0x200 } goto save_mark
+
+    }
+
+    # --- 统一的保存标记动作 ---
+    chain save_mark {
+        # 先根据不同的mark值进行分别计数
+        meta mark 0x100 counter comment "WAN流量计数"
+        meta mark 0x200 counter comment "VWAN1流量计数"
+        meta mark 0x300 counter comment "IPTV流量计数"
+  
+        meta mark != 0x100 meta mark != 0x200 meta mark != 0x300 limit rate 1/minute log prefix "Unknown mark: "
+        # 最后保存mark到连接跟踪（带总计数器）
+        counter ct mark set meta mark comment "总流量计数"
+    }
+}
+

@@ -1,0 +1,54 @@
+#!/bin/sh
+
+# Multi-WAN Hotplug Handler
+# 处理接口up/down事件，提供即时响应
+
+# 加载共享函数库
+. /lib/multiwan_common.sh
+
+case "$INTERFACE" in
+    wan)
+        # WAN接口事件处理
+        if [ "$ACTION" = "ifup" ]; then
+            log "multiwan-hotplug" "Interface $INTERFACE is up, updating routes and status immediately"
+            # 立即标记接口为up状态
+            update_interface_status "$INTERFACE" "up" "hotplug"
+            # 延迟2秒确保接口完全就绪后更新路由表
+            (sleep 2; setup_route "$INTERFACE" "100") &
+            # 通知tracker立即检查
+            notify_tracker "$INTERFACE"
+        elif [ "$ACTION" = "ifdown" ]; then
+            log "multiwan-hotplug" "Interface $INTERFACE is down, updating status immediately"
+            # 立即标记接口为down状态并更新路由
+            update_interface_status "$INTERFACE" "down" "hotplug"
+            # 通知tracker立即检查
+            notify_tracker "$INTERFACE"
+        fi
+        ;;
+    vwan1)
+        # VWAN接口事件处理
+        if [ "$ACTION" = "ifup" ]; then
+            log "multiwan-hotplug" "Interface $INTERFACE is up, updating routes and status immediately"
+            update_interface_status "$INTERFACE" "up" "hotplug"
+            (sleep 2; setup_route "$INTERFACE" "200") &
+            notify_tracker "$INTERFACE"
+        elif [ "$ACTION" = "ifdown" ]; then
+            log "multiwan-hotplug" "Interface $INTERFACE is down, updating status immediately"
+            update_interface_status "$INTERFACE" "down" "hotplug"
+            notify_tracker "$INTERFACE"
+        fi
+        ;;
+    iptv)
+        # IPTV接口事件处理
+        if [ "$ACTION" = "ifup" ]; then
+            log "multiwan-hotplug" "IPTV interface $INTERFACE is up, updating routes"
+            update_interface_status "$INTERFACE" "up" "hotplug"
+            (sleep 2; setup_route "$INTERFACE" "300") &
+            notify_tracker "$INTERFACE"
+        elif [ "$ACTION" = "ifdown" ]; then
+            log "multiwan-hotplug" "IPTV interface $INTERFACE is down"
+            update_interface_status "$INTERFACE" "down" "hotplug"
+            notify_tracker "$INTERFACE"
+        fi
+        ;;
+esac

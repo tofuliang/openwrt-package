@@ -1,0 +1,213 @@
+#!/bin/sh
+
+#================================================================
+# Multi-WAN Health Check Tracker
+# 单个接口的健康检查守护进程，模仿mwan3track的行为
+#================================================================
+
+INTERFACE="$1"
+[ -z "$INTERFACE" ] && {
+    echo "Usage: $0 <interface>"
+    exit 1
+}
+
+# 加载共享函数库
+. /lib/functions.sh
+. /lib/multiwan_common.sh
+
+# 从UCI配置加载接口参数
+load_config() {
+    config_load multiwan
+    
+    config_get_bool ENABLED "$INTERFACE" 'enabled' '0'
+    config_get TRACK_IPS "$INTERFACE" 'track_ip'
+    config_get RELIABILITY "$INTERFACE" 'reliability' '1'
+    config_get COUNT "$INTERFACE" 'count' '1'
+    config_get SIZE "$INTERFACE" 'size' '56'
+    config_get TIMEOUT "$INTERFACE" 'timeout' '2'
+    config_get TTL "$INTERFACE" 'max_ttl' '60'
+    config_get PING_INTERVAL "$INTERFACE" 'interval' '5'
+    config_get RECOVERY_INTERVAL "$INTERFACE" 'failure_interval' '5'
+    config_get DOWN_THRESHOLD "$INTERFACE" 'down' '3'
+    config_get UP_THRESHOLD "$INTERFACE" 'up' '3'
+    
+    # 重拨相关配置
+    config_get_bool AUTO_REDIAL "$INTERFACE" 'auto_redial' '1'
+    config_get REDIAL_THRESHOLD "$INTERFACE" 'redial_threshold' '10'
+    config_get REDIAL_INTERVAL "$INTERFACE" 'redial_interval' '60'
+    
+    # 转换track_ip为数组
+    TRACK_IP_LIST=""
+    for ip in $TRACK_IPS; do
+        TRACK_IP_LIST="$TRACK_IP_LIST $ip"
+    done
+}
+
+# 简化的健康检查函数（使用共享库）
+do_health_check() {
+    local result
+    if check_interface_health "$INTERFACE" "$TRACK_IP_LIST" "$RELIABILITY" "$COUNT" "$SIZE" "$TIMEOUT" "$TTL"; then
+        result=0
+        # log "multiwan-track-$INTERFACE" "Health check PASSED"
+    else
+        result=1
+        log "multiwan-track-$INTERFACE" "Health check FAILED"
+    fi
+    return $result
+}
+
+# 执行接口重拨
+do_redial() {
+    log "multiwan-track-$INTERFACE" "Attempting to redial interface $INTERFACE"
+    
+    # 记录重拨时间
+    echo "$(date +%s)" > "$STATE_DIR/${INTERFACE}_last_redial"
+    
+    # 执行完整的重拨过程
+    log "multiwan-track-$INTERFACE" "Bringing down interface $INTERFACE..."
+    ifdown "$INTERFACE"
+    sleep 3
+    
+    log "multiwan-track-$INTERFACE" "Bringing up interface $INTERFACE..."
+    ifup "$INTERFACE"
+    
+    # 等待接口稳定
+    log "multiwan-track-$INTERFACE" "Waiting for interface to stabilize..."
+    sleep 10
+    
+    # 强制触发路由恢复 - 直接调用setup_route而不是依赖hotplug
+    log "multiwan-track-$INTERFACE" "Triggering route recovery for $INTERFACE..."
+    case "$INTERFACE" in
+        "wan")
+            /etc/init.d/multiwan hotplug "$INTERFACE"
+            ;;
+        "vwan1") 
+            /etc/init.d/multiwan hotplug "$INTERFACE"
+            ;;
+        "iptv")
+            /etc/init.d/multiwan hotplug "$INTERFACE"
+            ;;
+    esac
+    
+    log "multiwan-track-$INTERFACE" "Redial and route recovery completed for interface $INTERFACE"
+}
+
+# 检查是否需要重拨
+should_redial() {
+    # 检查配置是否启用重拨
+    [ "$AUTO_REDIAL" -eq 0 ] && return 1
+    
+    # 检查失败次数是否达到阈值
+    local fail_count
+    fail_count=$(cat "$STATE_DIR/${INTERFACE}_fail_count" 2>/dev/null || echo "0")
+    [ "$fail_count" -lt "$REDIAL_THRESHOLD" ] && return 1
+    
+    # 检查上次重拨时间间隔
+    local last_redial now
+    last_redial=$(cat "$STATE_DIR/${INTERFACE}_last_redial" 2>/dev/null || echo "0")
+    now=$(date +%s)
+    
+    # 如果距离上次重拨不足设定间隔，不重拨
+    [ $((now - last_redial)) -lt "$REDIAL_INTERVAL" ] && return 1
+    
+    return 0
+}
+
+# --- 主程序 ---
+log "multiwan-track-$INTERFACE" "Starting health tracker for interface $INTERFACE"
+
+# 加载配置
+load_config
+
+# 检查配置
+if [ "$ENABLED" -eq 0 ]; then
+    log "multiwan-track-$INTERFACE" "Interface $INTERFACE is disabled in configuration"
+    exit 1
+fi
+
+if [ -z "$TRACK_IP_LIST" ]; then
+    log "multiwan-track-$INTERFACE" "No track IPs configured for interface $INTERFACE"
+    exit 1
+fi
+
+# 创建状态目录
+mkdir -p "$STATE_DIR"
+
+# 初始化状态（如果状态文件不存在）
+[ ! -f "$STATE_DIR/${INTERFACE}_status" ] && echo "up" > "$STATE_DIR/${INTERFACE}_status"
+[ ! -f "$STATE_DIR/${INTERFACE}_fail_count" ] && echo "0" > "$STATE_DIR/${INTERFACE}_fail_count"
+[ ! -f "$STATE_DIR/${INTERFACE}_success_count" ] && echo "0" > "$STATE_DIR/${INTERFACE}_success_count"
+
+log "multiwan-track-$INTERFACE" "Configuration loaded - Track IPs: $TRACK_IP_LIST, Reliability: $RELIABILITY"
+
+# 信号处理函数
+handle_signal() {
+    log "multiwan-track-$INTERFACE" "Received signal, performing immediate health check"
+    IMMEDIATE_CHECK=1
+}
+
+# 设置信号处理
+trap 'handle_signal' USR1
+
+# 主循环
+IMMEDIATE_CHECK=0
+while true; do
+    status=$(cat "$STATE_DIR/${INTERFACE}_status")
+    fail_count=$(cat "$STATE_DIR/${INTERFACE}_fail_count")
+    success_count=$(cat "$STATE_DIR/${INTERFACE}_success_count")
+    
+    if do_health_check; then
+        # 健康检查成功
+        if [ "$status" = "down" ]; then
+            success_count=$((success_count + 1))
+            echo $success_count > "$STATE_DIR/${INTERFACE}_success_count"
+            echo "0" > "$STATE_DIR/${INTERFACE}_fail_count"
+            
+            if [ $success_count -ge $UP_THRESHOLD ]; then
+                log "multiwan-track-$INTERFACE" "Interface $INTERFACE is back online (success count: $success_count/$UP_THRESHOLD)"
+                update_interface_status "$INTERFACE" "up" "tracker"
+            fi
+        else
+            # 接口已经是up状态，重置失败计数
+            echo "0" > "$STATE_DIR/${INTERFACE}_fail_count"
+        fi
+        sleep_interval=$PING_INTERVAL
+    else
+        # 健康检查失败
+        if [ "$status" = "up" ]; then
+            fail_count=$((fail_count + 1))
+            echo $fail_count > "$STATE_DIR/${INTERFACE}_fail_count"
+            echo "0" > "$STATE_DIR/${INTERFACE}_success_count"
+            
+            if [ $fail_count -ge $DOWN_THRESHOLD ]; then
+                log "multiwan-track-$INTERFACE" "Interface $INTERFACE has gone offline (fail count: $fail_count/$DOWN_THRESHOLD)"
+                update_interface_status "$INTERFACE" "down" "tracker"
+            fi
+        else
+            # 接口已经是down状态，重置成功计数
+            echo "0" > "$STATE_DIR/${INTERFACE}_success_count"
+            
+            # 检查是否需要重拨
+            if should_redial; then
+                log "multiwan-track-$INTERFACE" "Interface $INTERFACE has been down for too long (fail count: $fail_count), triggering redial"
+                do_redial
+                # 重拨后重置失败计数，给接口一些时间恢复
+                echo "0" > "$STATE_DIR/${INTERFACE}_fail_count"
+                sleep_interval=$((RECOVERY_INTERVAL * 3))  # 重拨后等待更长时间
+            else
+                sleep_interval=$RECOVERY_INTERVAL
+            fi
+        fi
+    fi
+    
+    # 如果收到立即检查信号，跳过睡眠
+    if [ "$IMMEDIATE_CHECK" -eq 1 ]; then
+        IMMEDIATE_CHECK=0
+        log "multiwan-track-$INTERFACE" "Skipping sleep due to immediate check request"
+        continue
+    fi
+    
+    # 使用可中断的睡眠，以便响应信号
+    sleep "$sleep_interval" &
+    wait $!
+done

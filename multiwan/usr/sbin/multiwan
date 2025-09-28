@@ -1,0 +1,364 @@
+#!/bin/sh
+
+# Multi-WAN Management Script
+# 提供状态查看和管理功能
+
+STATE_DIR="/var/run/multiwan"
+NFT_TABLE="multiwan"
+
+show_status() {
+    echo "=== Multi-WAN Status ==="
+    echo
+    
+    # 显示接口状态
+    echo "Interface Status:"
+    for iface in wan vwan1 iptv; do
+        if [ -f "$STATE_DIR/${iface}_status" ]; then
+            status=$(cat "$STATE_DIR/${iface}_status")
+            fail_count=0
+            success_count=0
+            [ -f "$STATE_DIR/${iface}_fail_count" ] && fail_count=$(cat "$STATE_DIR/${iface}_fail_count")
+            [ -f "$STATE_DIR/${iface}_success_count" ] && success_count=$(cat "$STATE_DIR/${iface}_success_count")
+            printf "  %-8s: %-4s (fail: %d, success: %d)\n" "$iface" "$status" "$fail_count" "$success_count"
+        else
+            printf "  %-8s: unknown\n" "$iface"
+        fi
+    done
+    
+    echo
+    
+    # 显示当前路由状态
+    echo "Routing State:"
+    if [ -f "$STATE_DIR/routing_state" ]; then
+        routing_state=$(cat "$STATE_DIR/routing_state")
+        echo "  Current: $routing_state"
+    else
+        echo "  Current: unknown"
+    fi
+    
+    echo
+    
+    # 显示策略路由规则
+    echo "Policy Routing Rules:"
+    ip rule show | grep -E "lookup (100|200|300)" | while read rule; do
+        echo "  $rule"
+    done
+    
+    echo
+    
+    # 显示路由表
+    for table in 100 200 300; do
+        table_name=""
+        case $table in
+            100) table_name="WAN" ;;
+            200) table_name="VWAN1" ;;
+            300) table_name="IPTV" ;;
+        esac
+        echo "Routing Table $table ($table_name):"
+        ip route show table $table | while read route; do
+            echo "  $route"
+        done
+        echo
+    done
+    
+    # 显示NFT集合状态
+    echo "NFTables Sets:"
+    nft list set inet $NFT_TABLE iptv 2>/dev/null
+    nft list set inet $NFT_TABLE no_balanced 2>/dev/null
+}
+
+show_connections() {
+    echo "=== Active Connections by Mark ==="
+    echo
+    
+    # 先检查conntrack是否可用
+    if ! command -v conntrack >/dev/null 2>&1; then
+        echo "  Error: conntrack command not found"
+        return 1
+    fi
+    
+    # 显示按mark分组的连接数，排除局域网到局域网的连接
+    conntrack -L |grep -v ':' 2>/dev/null | awk '
+    function is_private_ip(ip) {
+        # 检查是否为局域网IP
+        if (ip ~ /^10\./) return 1
+        if (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) return 1
+        if (ip ~ /^192\.168\./) return 1
+        if (ip ~ /^127\./) return 1
+        if (ip ~ /^169\.254\./) return 1
+        return 0
+    }
+    {
+        # 提取src和dst IP地址
+        src_ip = ""
+        dst_ip = ""
+        for (i = 1; i <= NF; i++) {
+            if (src_ip == "" && $i ~ /^src=/) {
+                gsub(/src=/, "", $i)
+                src_ip = $i
+            } else if (dst_ip == "" && $i ~ /^dst=/) {
+                gsub(/dst=/, "", $i)
+                dst_ip = $i
+            }
+        }
+        
+        # 如果src和dst都是局域网IP，跳过此连接
+        if (src_ip != "" && dst_ip != "" && is_private_ip(src_ip) && is_private_ip(dst_ip)) {
+            next
+        }
+        
+        # 直接搜索mark=数字的模式
+        if (match($0, /mark=([0-9]+)/)) {
+            # 提取mark值
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^mark=/) {
+                    gsub(/mark=/, "", $i)
+                    mark_value = $i + 0  # 转换为数字
+                    break
+                }
+            }
+            
+            # 按mark值分类
+            if (mark_value == 256) {
+                wan_count++
+            } else if (mark_value == 512) {
+                vwan_count++
+            } else if (mark_value == 768) {
+                iptv_count++
+            } else {
+                other_count++
+                other_marks[mark_value]++
+            }
+            total_count++
+        }
+    }
+    END {
+        # 显示统计结果
+        if (wan_count > 0) printf "  %-15s: %d connections\n", "WAN (0x100)", wan_count
+        if (vwan_count > 0) printf "  %-15s: %d connections\n", "VWAN1 (0x200)", vwan_count
+        if (iptv_count > 0) printf "  %-15s: %d connections\n", "IPTV (0x300)", iptv_count
+        if (other_count > 0) {
+            for (mark in other_marks) {
+                if (mark == 0) {
+                    printf "  %-15s: %d connections\n", "Unmarked", other_marks[mark]
+                } else {
+                    printf "  %-15s: %d connections\n", "Other (" mark ")", other_marks[mark]
+                }
+            }
+        }
+        printf "  %-15s: %d connections\n", "Total", total_count
+        
+        # 如果没有找到任何带mark的连接，显示调试信息
+        if (total_count == 0) {
+            print ""
+            print "Debug: No connections with marks found."
+            print "Sample conntrack output (first 3 lines):"
+            system("conntrack -L 2>/dev/null | head -3")
+        }
+    }'
+}
+
+add_no_balance() {
+    local ip="$1"
+    if [ -z "$ip" ]; then
+        echo "Usage: $0 add-no-balance <ip_address>"
+        exit 1
+    fi
+    
+    echo "Adding $ip to no-balance set..."
+    nft add element inet $NFT_TABLE no_balanced { $ip }
+    echo "Done."
+}
+
+remove_no_balance() {
+    local ip="$1"
+    if [ -z "$ip" ]; then
+        echo "Usage: $0 remove-no-balance <ip_address>"
+        exit 1
+    fi
+    
+    echo "Removing $ip from no-balance set..."
+    nft delete element inet $NFT_TABLE no_balanced { $ip }
+    echo "Done."
+}
+
+list_no_balance() {
+    echo "=== No-Balance IP List ==="
+    nft list set inet $NFT_TABLE no_balanced 2>/dev/null
+}
+
+list_iptv_set() {
+    echo "=== IPTV IP Set ==="
+    nft list set inet $NFT_TABLE iptv 2>/dev/null
+}
+
+show_counters() {
+    echo "=== NFTables Rule Counters ==="
+    echo
+    
+    echo "PREROUTING Chain (转发流量):"
+    nft list chain inet $NFT_TABLE prerouting_hook | grep -E "counter|comment" | awk '{print NR-1". "$0}'
+    echo
+    
+    echo "OUTPUT Chain (路由器自身流量):"
+    nft list chain inet $NFT_TABLE output_hook | grep -E "counter|comment" | awk '{print NR-1". "$0}'
+    echo
+    
+    echo "SAVE_MARK Chain (标记保存):"
+    nft list chain inet $NFT_TABLE save_mark | grep -E "counter|comment" | awk '{print NR-1". "$0}'
+    echo
+}
+
+show_balance_stats() {
+    echo "=== 负载均衡效果统计 ==="
+    echo
+    
+    # 提取各线路的包数和字节数
+    local wan_stats vwan_stats iptv_stats
+    wan_stats=$(nft list chain inet $NFT_TABLE save_mark | grep "WAN流量计数")
+    vwan_stats=$(nft list chain inet $NFT_TABLE save_mark | grep "VWAN1流量计数")
+    iptv_stats=$(nft list chain inet $NFT_TABLE save_mark | grep "IPTV流量计数")
+    
+    # 解析数据 - 使用awk提取数字
+    local wan_pkts wan_bytes vwan_pkts vwan_bytes iptv_pkts iptv_bytes
+    wan_pkts=$(echo "$wan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="packets") print $(i+1)}')
+    wan_bytes=$(echo "$wan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="bytes") print $(i+1)}')
+    vwan_pkts=$(echo "$vwan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="packets") print $(i+1)}')
+    vwan_bytes=$(echo "$vwan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="bytes") print $(i+1)}')
+    iptv_pkts=$(echo "$iptv_stats" | awk '{for(i=1;i<=NF;i++) if($i=="packets") print $(i+1)}')
+    iptv_bytes=$(echo "$iptv_stats" | awk '{for(i=1;i<=NF;i++) if($i=="bytes") print $(i+1)}')
+    
+    # 设置默认值
+    [ -z "$wan_pkts" ] && wan_pkts=0
+    [ -z "$wan_bytes" ] && wan_bytes=0
+    [ -z "$vwan_pkts" ] && vwan_pkts=0
+    [ -z "$vwan_bytes" ] && vwan_bytes=0
+    [ -z "$iptv_pkts" ] && iptv_pkts=0
+    [ -z "$iptv_bytes" ] && iptv_bytes=0
+    
+    # 计算总数
+    local total_pkts total_bytes
+    total_pkts=$((wan_pkts + vwan_pkts + iptv_pkts))
+    total_bytes=$((wan_bytes + vwan_bytes + iptv_bytes))
+    
+    echo "流量分布统计:"
+    printf "  %-8s: %10s 包, %15s 字节", "WAN" "$wan_pkts" "$wan_bytes"
+    [ $total_pkts -gt 0 ] && printf " (%.1f%%)" $((wan_pkts * 100 / total_pkts))
+    echo
+    
+    printf "  %-8s: %10s 包, %15s 字节", "VWAN1" "$vwan_pkts" "$vwan_bytes"
+    [ $total_pkts -gt 0 ] && printf " (%.1f%%)" $((vwan_pkts * 100 / total_pkts))
+    echo
+    
+    printf "  %-8s: %10s 包, %15s 字节", "IPTV" "$iptv_pkts" "$iptv_bytes"
+    [ $total_pkts -gt 0 ] && printf " (%.1f%%)" $((iptv_pkts * 100 / total_pkts))
+    echo
+    
+    echo "  --------"
+    printf "  %-8s: %10s 包, %15s 字节\n" "总计" "$total_pkts" "$total_bytes"
+    echo
+    
+    # 负载均衡评估 (仅WAN+VWAN1)
+    local balance_pkts balance_bytes
+    balance_pkts=$((wan_pkts + vwan_pkts))
+    balance_bytes=$((wan_bytes + vwan_bytes))
+    
+    if [ $balance_pkts -gt 0 ]; then
+        echo "负载均衡评估 (WAN vs VWAN1):"
+        local wan_ratio vwan_ratio
+        wan_ratio=$((wan_pkts * 100 / balance_pkts))
+        vwan_ratio=$((vwan_pkts * 100 / balance_pkts))
+        printf "  WAN:   %d%% (%s包)\n" "$wan_ratio" "$wan_pkts"
+        printf "  VWAN1: %d%% (%s包)\n" "$vwan_ratio" "$vwan_pkts"
+        
+        # 均衡度评估
+        local diff=$((wan_ratio - vwan_ratio))
+        [ $diff -lt 0 ] && diff=$((-diff))
+        
+        if [ $diff -le 10 ]; then
+            echo "  均衡度: 优秀 (差异${diff}%)"
+        elif [ $diff -le 20 ]; then
+            echo "  均衡度: 良好 (差异${diff}%)"
+        elif [ $diff -le 30 ]; then
+            echo "  均衡度: 一般 (差异${diff}%)"
+        else
+            echo "  均衡度: 较差 (差异${diff}%)"
+        fi
+    else
+        echo "负载均衡评估: 暂无数据"
+    fi
+    echo
+}
+
+reset_counters() {
+    echo "重置所有计数器..."
+    nft reset counters table inet $NFT_TABLE 2>/dev/null
+    echo "计数器已重置"
+}
+
+flush_conntrack() {
+    echo "Flushing connection tracking table..."
+    conntrack -F 2>/dev/null
+    echo "Done."
+}
+
+restart_service() {
+    echo "Restarting Multi-WAN service..."
+    /etc/init.d/multiwan restart
+    echo "Done."
+}
+
+COMMAND="${1:-status}"
+case "$COMMAND" in
+    "restart")
+        restart_service
+        ;;
+    "status")
+        show_status
+        show_balance_stats
+        ;;
+    "connections"|"conn")
+        show_connections
+        ;;
+    "counters"|"cts")
+        show_counters
+        ;;
+    "reset-counters"|"rst-cts")
+        reset_counters
+        ;;
+    "add-no-balance"|"add-nb")
+        add_no_balance "$2"
+        ;;
+    "remove-no-balance"|"rm-nb")
+        remove_no_balance "$2"
+        ;;
+    "list-no-balance"|"lst-nb")
+        list_no_balance
+        ;;
+    "list-iptv"|"lst-iptv")
+        list_iptv_set
+        ;;
+    "flush-conntrack"|"flsh-cts")
+        flush_conntrack
+        ;;
+    *)
+        echo "Multi-WAN Management Script"
+        echo
+        echo "Usage: $0 [command]"
+        echo
+        echo "Commands:"
+        echo "  status                    Show multi-wan status (default)"
+        echo "  restart                   Restart multi-wan service"
+        echo "  connections|conn          Show active connections by interface"
+        echo "  counters|cts              Show NFTables rule counters"
+        echo "  reset-counters|rst-cts    Reset all NFTables counters"
+        echo "  add-no-balance|add-nb IP  Add IP to no-balance set (force VWAN1)"
+        echo "  remove-no-balance|rm-nb   IP Remove IP from no-balance set"
+        echo "  list-no-balance|lst-nb    List IPs in no-balance set"
+        echo "  list-iptv|lst-iptv        List IPs in IPTV set"
+        echo "  flush-conntrack|flsh-cts  Flush connection tracking table"
+        echo
+        exit 1
+        ;;
+esac
+

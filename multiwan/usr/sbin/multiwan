@@ -1,95 +1,494 @@
 #!/bin/sh
 
 # Multi-WAN Management Script
-# 提供状态查看和管理功能
+# status and management CLI
 
 STATE_DIR="/var/run/multiwan"
 NFT_TABLE="multiwan"
 
-show_status() {
-    echo "=== Multi-WAN Status ==="
+# 复用共享库（提供 force_store_* / restore_force_sets 等持久化助手）；
+# 库缺失时降级为"仅操作 nft、不持久化"，不影响其余功能。
+if [ -r /lib/multiwan_common.sh ]; then
+    . /lib/multiwan_common.sh
+else
+    force_store_file() { printf '%s\n' "${MULTIWAN_FORCE_FILE:-/etc/multiwan/force_egress.list}"; }
+    force_store_add() { :; }
+    force_store_del() { :; }
+fi
+
+# 将策略子链规则翻译成人类可读的出口说明
+describe_exit() {
+    local rule=$1 marks exits
+
+    if [ -z "$rule" ]; then
+        echo "未设置"
+        return
+    fi
+
+    if echo "$rule" | grep -q 'jhash'; then
+        marks=$(echo "$rule" | grep -o '0x[0-9a-f]\{8\}' | sort -u)
+        exits=""
+        echo "$marks" | grep -q '0x00010000' && exits="$exits WAN"
+        echo "$marks" | grep -q '0x00020000' && exits="$exits VWAN1"
+        echo "$marks" | grep -q '0x00040000' && exits="$exits VWAN2"
+        echo "按连接哈希在${exits} 间均衡"
+        return
+    fi
+
+    case "$rule" in
+        *0x00010000*) echo "WAN(电信)" ;;
+        *0x00020000*) echo "VWAN1(电信)" ;;
+        *0x00030000*) echo "IPTV(电信)" ;;
+        *0x00040000*) echo "VWAN2(移动)" ;;
+        *) echo "$rule" ;;
+    esac
+}
+
+# 汇总两个 hook 中所有 goto route_* 规则的字节数，按目标链归并
+policy_branch_bytes() {
+    for ch in prerouting_hook output_hook; do
+        nft -a list chain inet "$NFT_TABLE" "$ch" 2>/dev/null
+    done | awk '
+        /goto route_/ {
+            b = 0; t = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "bytes") b = $(i + 1)
+                if ($i == "goto") t = $(i + 1)
+            }
+            if (t != "") sum[t] += b
+        }
+        END { for (t in sum) printf "%s %s\n", t, sum[t] }'
+}
+
+# 强制出口集合内容与命中计数（两个 hook 的 counter 之和）
+force_set_elements() {
+    nft list set inet "$NFT_TABLE" "$1" 2>/dev/null | tr -d '\n' | awk '
+        { i = index($0, "elements = {"); if (i == 0) exit
+          s = substr($0, i + 12); j = index(s, "}"); if (j == 0) j = length(s) + 1
+          s = substr(s, 1, j - 1)
+          gsub(/[ \t]+/, " ", s)                 # 折叠制表符/换行残留
+          gsub(/ *expires [0-9a-z]+/, "", s)      # 动态集合的超时字段不展示
+          gsub(/^ +| +$/, "", s)
+          print s }'
+}
+
+# 折行输出（busybox 无 fold）
+wrap_indent() {
+    awk -v w=70 -v pad="      " '
+        { n = split($0, a, ", "); line = ""
+          for (i = 1; i <= n; i++) {
+              if (line != "" && length(line) + length(a[i]) + 2 > w) { print pad line; line = "" }
+              line = (line == "" ? a[i] : line ", " a[i])
+          }
+          if (line != "") print pad line }'
+}
+
+force_set_bytes() {
+    local set="$1" ch total=0 part
+    for ch in prerouting_hook output_hook; do
+        part=$(nft -a list chain inet "$NFT_TABLE" "$ch" 2>/dev/null | awk -v S="@$set " '
+            index($0, S) {
+                for (i = 1; i <= NF; i++) if ($i == "bytes") b = $(i + 1)
+            }
+            END { print b + 0 }')
+        total=$((total + part))
+    done
+    echo "$total"
+}
+
+show_force_status() {
+    local spec name desc elems cnt hits shown=0
+
+    subsec "强制出口（force 集合优先于全部目的地分类）"
+    for spec in "force_wan WAN" "force_vwan1 VWAN1" "force_vwan2 VWAN2(移动)" \
+                "force6_wan WAN" "force6_vwan1 VWAN1" "force6_vwan2 VWAN2(移动)"; do
+        set -- $spec
+        name="$1"; desc="$2"
+        elems=$(force_set_elements "$name")
+        [ -n "$elems" ] || continue
+        cnt=$(printf '%s\n' "$elems" | tr ',' '\n' | grep -c '[^[:space:]]')
+        hits=$(force_set_bytes "$name")
+        desc_colored=$(color_exit "$(printf '%-12s' "$desc")")
+        printf "  %s%-14s%s → %s %2s 条  命中 %s%s%s\n" "$C_BOLD" "$name" "$C_RESET" \
+            "$desc_colored" "$cnt" "$C_GREEN" "$(human "$hits")" "$C_RESET"
+        printf '%s\n' "$elems" | wrap_indent
+        shown=1
+    done
+    [ "$shown" = 1 ] || echo "  （无，可用 multiwan force-wan|force-vwan1|force-vwan2 <IP> 添加）"
     echo
-    
-    # 显示接口状态
-    echo "Interface Status:"
-    for iface in wan vwan1 iptv; do
+}
+
+# --- 输出格式：线框 + 颜色（非 TTY 或 NO_COLOR 时自动降级为纯文本） ---
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] || [ -n "${FORCE_COLOR:-}" ]; then
+    C_RESET=$(printf '\033[0m'); C_BOLD=$(printf '\033[1m'); C_DIM=$(printf '\033[2m')
+    C_RED=$(printf '\033[31m'); C_GREEN=$(printf '\033[32m'); C_YELLOW=$(printf '\033[33m')
+    C_BLUE=$(printf '\033[34m'); C_CYAN=$(printf '\033[36m'); C_MAGENTA=$(printf '\033[35m')
+else
+    C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_CYAN=''; C_MAGENTA=''
+fi
+
+# 生成 n 个重复字符（按字节宽度计算，CJK 会略窄，肉眼足够齐）
+rule() {
+    awk -v n="$1" -v ch="$2" 'BEGIN { s = ""; for (i = 0; i < n; i++) s = s ch; print s }'
+}
+
+# 区块头：┌─ 标题 ─────────────
+sec() {
+    local title="$1" pad
+    pad=$(rule "$(( 64 - ${#title} ))" "─")
+    printf '%s┌─%s %s%s%s %s%s\n' "$C_DIM" "$C_RESET" "$C_BOLD$C_CYAN" "$title" "$C_RESET$C_DIM" "$pad" "$C_RESET"
+}
+
+sec_end() {
+    printf '%s└%s\n\n' "$C_DIM" "$C_RESET"
+}
+
+# 集合元素计数（interval 合并后按逗号分隔项计）
+set_elements() {
+    nft list set inet "$NFT_TABLE" "$1" 2>/dev/null | tr -d '\n' | awk '
+        { i = index($0, "elements = {"); if (i == 0) exit
+          s = substr($0, i + 12); j = index(s, "}"); if (j == 0) j = length(s) + 1
+          s = substr(s, 1, j - 1)
+          gsub(/[ \t]+/, " ", s)                 # busybox tr 不支持 [:space:]，在 awk 内折叠
+          gsub(/ *expires [0-9a-z]+/, "", s)      # 动态集合的超时字段不展示
+          gsub(/^ +| +$/, "", s)
+          print s }'
+}
+
+set_count() {
+    set_elements "$1" | tr ',' '\n' | grep -c '[^[:space:]]'
+}
+
+set_type() {
+    nft list set inet "$NFT_TABLE" "$1" 2>/dev/null | awk '/^[[:space:]]*type /{print $2; exit}'
+}
+
+# 集合总览：表格 + 小集合明细
+show_sets() {
+    local spec name desc type count shown=0
+
+    subsec "NFTables 集合"
+    printf "  %s %s %s  %s\n" "$(printf '%s%-30s%s' "$C_BOLD" "set" "$C_RESET")" \
+        "$(printf '%s%-8s%s' "$C_DIM" "type" "$C_RESET")" \
+        "$(printf '%s%8s%s' "$C_BOLD" "elems" "$C_RESET")" "$(kv_dim "usage")"
+
+    for spec in \
+        "iptv|IPTV 目标（走 IPTV 线）" \
+        "no_balanced|强制走 WAN（动态，10m 超时）" \
+        "localnetwork6|本机/内网前缀（不参与策略）" \
+        "mobile_destinations|移动目标 → VWAN2" \
+        "telecom_destinations|电信目标 → WAN/VWAN1" \
+        "china_destinations|中国大陆 → 三线哈希" \
+        "cloudflare_destinations|Cloudflare → VWAN2" \
+        "mobile6_destinations|移动 v6 → VWAN2" \
+        "telecom6_destinations|电信 v6 → WAN/VWAN1" \
+        "china6_destinations|中国 v6 → 三线哈希" \
+        "cloudflare6_destinations|Cloudflare v6 → VWAN2"; do
+        name="${spec%%|*}"; desc="${spec#*|}"
+        type=$(set_type "$name")
+        [ -n "$type" ] || continue
+        count=$(set_count "$name")
+        printf "  %-30s %s%-8s%s %s%8s%s  %s\n" "$(col_line "$(printf '%-30s' "$name")")" \
+            "$C_DIM" "$type" "$C_RESET" "$C_GREEN" "$count" "$C_RESET" "$(col_line "$desc")"
+        shown=$((shown + 1))
+    done
+    [ "$shown" -gt 0 ] || printf "  （未找到集合）\n"
+
+    # 小集合列出元素（大集合只给计数，避免刷屏）
+    for name in iptv no_balanced localnetwork6; do
+        elements=$(set_elements "$name")
+        [ -n "$elements" ] || continue
+        printf "  %s%s%s 明细：\n" "$C_BOLD" "$name" "$C_RESET"
+        printf '%s\n' "$elements" | wrap_indent
+    done
+}
+
+# 线路标识配色（全局统一）：WAN=蓝 VWAN1=青 VWAN2=洋红 IPTV=黄
+# 注意匹配顺序：先 VWAN* 再 WAN（"VWAN2" 含子串 "WAN"）
+col_line() {
+    case "$1" in
+        # 多线/无归属描述优先判为中性（"按连接哈希在 WAN VWAN1 VWAN2 间均衡" 不应显示成单线色）
+        *均衡*|*international*|*force6_wan6*)
+            printf '%s%s%s' "$C_DIM" "$1" "$C_RESET" ;;
+        # 再匹配 VWAN*/移动，避免被 "WAN" 子串提前吃掉
+        *VWAN2*|*vwan2*|*0x00040000*|*mobile*|*cloudflare*|*force6_vwan2*|*force_vwan2*)
+            printf '%s%s%s' "$C_MAGENTA" "$1" "$C_RESET" ;;
+        *VWAN1*|*vwan1*|*0x00020000*|*telecom*|*force6_vwan1*|*force_vwan1*)
+            printf '%s%s%s' "$C_CYAN" "$1" "$C_RESET" ;;
+        *IPTV*|*iptv*|*0x00030000*)
+            printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
+        *WAN*|*wan*|*0x00010000*|*no_balanced*|*force6_wan*|*force_wan*)
+            printf '%s%s%s' "$C_BLUE" "$1" "$C_RESET" ;;
+        # 多线/无归属/本机前缀：次要信息走暗色
+        *) printf '%s%s%s' "$C_DIM" "$1" "$C_RESET" ;;
+    esac
+}
+
+color_exit() { col_line "$1"; }
+
+# --- 强制出口（force 集合）---
+force_egress() {
+    local line="$1" ip="$2" set sfx
+
+    if [ -z "$ip" ]; then
+        echo "用法：$0 force-wan|force-vwan1|force-vwan2 <IP>"
+        exit 1
+    fi
+    sfx=""
+    case "$ip" in
+        *:*) sfx="6" ;;
+    esac
+    case "$line" in
+        wan) set="force${sfx}_wan" ;;
+        vwan1) set="force${sfx}_vwan1" ;;
+        vwan2) set="force${sfx}_vwan2" ;;
+        *) echo "未知出口：$line" >&2; exit 1 ;;
+    esac
+    echo "将 $ip 固定走 $line（集合 $set）..."
+    nft add element inet "$NFT_TABLE" "$set" { "$ip" }
+    force_store_add "$set" "$ip"
+    echo "完成（已写入 $(force_store_file)，重启后自动恢复）。"
+}
+
+unforce_egress() {
+    local ip="$1" set
+
+    if [ -z "$ip" ]; then
+        echo "用法：$0 unforce <IP>"
+        exit 1
+    fi
+    for set in force_wan force_vwan1 force_vwan2 force6_wan force6_vwan1 force6_vwan2; do
+        nft delete element inet "$NFT_TABLE" "$set" { "$ip" } 2>/dev/null && echo "已从 $set 移除 $ip"
+    done
+    force_store_del "$ip"
+    echo "完成。"
+}
+
+list_force() {
+    sec "强制出口 IP 列表"
+    for set in force_wan force_vwan1 force_vwan2 force6_wan force6_vwan1 force6_vwan2; do
+        elements=$(force_set_elements "$set")
+        printf "  %s%-14s%s [%s]\n" "$C_BOLD" "$set" "$C_RESET" "$elements"
+    done
+    printf '  %s持久化：%s（重启/升级后自动恢复）%s\n' "$C_DIM" "$(force_store_file)" "$C_RESET"
+    sec_end
+}
+
+# 按"显示列宽"补齐（CJK 记 2 列，ASCII 记 1 列），用于表头与数据行对齐
+padw() {
+    awk -v w="$1" -v t="$2" '
+        BEGIN {
+            for (k = 0; k < 256; k++) ORD[sprintf("%c", k)] = k
+            n = 0
+            for (i = 1; i <= length(t); i++) {
+                v = ORD[substr(t, i, 1)]
+                if (v >= 192) n += 2          # UTF-8 首字节：CJK 等宽字符记 2 列
+                else if (v < 128) n += 1      # ASCII
+            }
+            printf "%s", t
+            for (i = n; i < w; i++) printf " "
+        }'
+}
+
+# 按显示列宽右对齐（数值列表头用）
+padw_r() {
+    awk -v w="$1" -v t="$2" '
+        BEGIN {
+            for (k = 0; k < 256; k++) ORD[sprintf("%c", k)] = k
+            n = 0
+            for (i = 1; i <= length(t); i++) {
+                v = ORD[substr(t, i, 1)]
+                if (v >= 192) n += 2
+                else if (v < 128) n += 1
+            }
+            for (i = n; i < w; i++) printf " "
+            printf "%s", t
+        }'
+}
+
+# 字节数转可读单位
+human() {
+    awk -v b="$1" 'BEGIN {
+        if (b >= 1073741824) printf "%.2f GB", b / 1073741824
+        else if (b >= 1048576) printf "%.1f MB", b / 1048576
+        else if (b >= 1024) printf "%.1f KB", b / 1024
+        else printf "%d B", b
+    }'
+}
+
+# 子标题
+subsec() {
+    printf '  %s%s%s\n' "$C_BOLD" "$1" "$C_RESET"
+}
+
+# 关键字着色
+kv_up()   { printf '%s%s%s' "$C_GREEN" "$1" "$C_RESET"; }
+kv_down() { printf '%s%s%s' "$C_RED" "$1" "$C_RESET"; }
+kv_warn() { printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET"; }
+kv_dim()  { printf '%s%s%s' "$C_DIM" "$1" "$C_RESET"; }
+
+show_status() {
+    local cum_file
+    sec "多 WAN 状态"
+
+    # interface status incl. family
+    subsec "接口状态"
+    for iface in wan vwan1 vwan2 iptv; do
         if [ -f "$STATE_DIR/${iface}_status" ]; then
             status=$(cat "$STATE_DIR/${iface}_status")
             fail_count=0
             success_count=0
             [ -f "$STATE_DIR/${iface}_fail_count" ] && fail_count=$(cat "$STATE_DIR/${iface}_fail_count")
             [ -f "$STATE_DIR/${iface}_success_count" ] && success_count=$(cat "$STATE_DIR/${iface}_success_count")
-            printf "  %-8s: %-4s (fail: %d, success: %d)\n" "$iface" "$status" "$fail_count" "$success_count"
+            family=$(uci -q get multiwan."$iface".family)
+            case "$status" in
+                up) colored=$(kv_up "$status") ;;
+                down) colored=$(kv_down "$status") ;;
+                *) colored=$(kv_warn "$status") ;;
+            esac
+            [ "$fail_count" -gt 0 ] 2>/dev/null && fails=$(kv_down "$fail_count") || fails=$(kv_dim "$fail_count")
+            printf "  %-24s: %-16s (失败: %s, 成功: %s) %s\n" "$(col_line "$iface")" "$colored" "$fails" "$(kv_dim "$success_count")" "$(kv_dim "family=${family:-ipv4}")"
         else
-            printf "  %-8s: unknown\n" "$iface"
+            printf "  %-8s: 未知\n" "$iface"
         fi
     done
-    
+
     echo
-    
-    # 显示当前路由状态
-    echo "Routing State:"
+
+    # per-WAN public v4/v6 addresses
+    subsec "WAN 地址"
+    for iface in wan vwan1 vwan2 iptv; do
+        dev=$(ubus call network.interface."$iface" status 2>/dev/null | jsonfilter -e '@.l3_device')
+        [ -n "$dev" ] || continue
+        v4=$(ip -4 -o addr show dev "$dev" 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
+        v6=$(ip -6 -o addr show dev "$dev" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
+        printf "  %-24s %s%-14s%s" "$(col_line "$iface")" "$C_DIM" "$dev" "$C_RESET"
+        [ -n "$v4" ] && printf " v4: %s%s%s" "$C_CYAN" "$v4" "$C_RESET" || printf " v4: -"
+        [ -n "$v6" ] && printf "  v6: %s%s%s" "$C_CYAN" "$v6" "$C_RESET"
+        echo
+    done
+
+    echo
+
+    # routing state
+    subsec "路由状态"
     if [ -f "$STATE_DIR/routing_state" ]; then
         routing_state=$(cat "$STATE_DIR/routing_state")
-        echo "  Current: $routing_state"
+        case "$routing_state" in
+            balanced) rs=$(kv_up "$routing_state") ;;
+            unknown)  rs=$(kv_dim "$routing_state") ;;
+            *)        rs=$(kv_warn "$routing_state") ;;
+        esac
+        printf "  当前：%s\n" "$rs"
     else
-        echo "  Current: unknown"
+        echo "  当前：未知"
     fi
-    
-    echo
-    
-    # 显示策略路由规则
-    echo "Policy Routing Rules:"
-    ip rule show | grep -E "lookup (100|200|300)" | while read rule; do
-        echo "  $rule"
+
+    # 目的地址策略：v4 与 v6 出口选择（附累计字节）
+    subsec "目的地址策略（累计字节，含历史）"
+    printf "  %-22s %14s  %s\n" "branch" "bytes" "exit"
+    cum_file=$(mktemp "${TMPDIR:-/tmp}/multiwan-cum.XXXXXX")
+    policy_branch_bytes > "$cum_file"
+    for chain in route_mobile route_telecom route_china route_international route_mobile6 route_telecom6 route_china6 route_international6; do
+        rule=$(nft list chain inet $NFT_TABLE "$chain" 2>/dev/null | grep 'meta mark set' | head -1 | sed 's/^[[:space:]]*//')
+        bytes=$(awk -v c="$chain" '$1 == c { print $2 }' "$cum_file")
+        printf "  %s %s%14s%s  %s\n" "$(col_line "$(printf '%-22s' "$chain")")" \
+            "$C_GREEN" "$(human "${bytes:-0}")" "$C_RESET" "$(col_line "$(describe_exit "$rule")")"
     done
-    
+    rm -f "$cum_file"
+    echo "  占比按采样窗口计算，见下方“目的地址策略占比”。"
+
     echo
-    
-    # 显示路由表
-    for table in 100 200 300; do
+    show_force_status
+
+    # policy routing rules
+    subsec "策略路由规则 (v4)"
+    ip rule show 2>/dev/null | grep -E "lookup (100|200|300|400)" | while read -r rule; do
+        printf '  %s\n' "$(col_line "$rule")"
+    done
+    subsec "策略路由规则 (v6)"
+    ip -6 rule show 2>/dev/null | grep -E "lookup (100|200|300|400)" | while read -r rule; do
+        printf '  %s\n' "$(col_line "$rule")"
+    done
+    echo
+
+    # routing tables
+    for table in 100 200 300 400; do
         table_name=""
         case $table in
-            100) table_name="WAN" ;;
-            200) table_name="VWAN1" ;;
-            300) table_name="IPTV" ;;
+            100) table_name="WAN(电信)" ;;
+            200) table_name="VWAN1(电信)" ;;
+            300) table_name="IPTV(电信)" ;;
+            400) table_name="VWAN2(移动)" ;;
         esac
-        echo "Routing Table $table ($table_name):"
-        ip route show table $table | while read route; do
+        printf '  路由表 %s%d%s (%s)\n' "$C_BOLD" "$table" "$C_RESET" "$(col_line "$table_name")"
+        ip route show table $table 2>/dev/null | while read -r route; do
             echo "  $route"
+        done
+        ip -6 route show table $table 2>/dev/null | grep -v 'Dump terminated' | while read -r route; do
+            [ -n "$route" ] && printf '  %s  %s[IPv6]%s\n' "$route" "$C_DIM" "$C_RESET"
         done
         echo
     done
-    
-    # 显示NFT集合状态
-    echo "NFTables Sets:"
-    nft list set inet $NFT_TABLE iptv 2>/dev/null
-    nft list set inet $NFT_TABLE no_balanced 2>/dev/null
+
+    # nft sets
+    show_sets
+    subsec "IPv6 出口钩子规则"
+    nft -a list chain inet $NFT_TABLE output_hook 2>/dev/null \
+        | grep -E 'cloudflare6_destinations|localnetwork6|route_international6' | awk \
+        -v D="$C_DIM" -v X="$C_RESET" -v M="$C_MAGENTA" -v C="$C_CYAN" -v B="$C_BLUE" -v Y="$C_YELLOW" '
+        function hb(b) {
+            if (b >= 1073741824) return sprintf("%.2f GB", b / 1073741824)
+            if (b >= 1048576)    return sprintf("%.1f MB", b / 1048576)
+            if (b >= 1024)       return sprintf("%.1f KB", b / 1024)
+            return b " B"
+        }
+        {
+            line = $0
+            if (match(line, /bytes [0-9]+/)) {
+                n = substr(line, RSTART + 6, RLENGTH - 6) + 0
+                sub(/bytes [0-9]+/, "bytes " hb(n), line)
+            }
+            if (match(line, /# handle [0-9]+$/)) {
+                h = substr(line, RSTART)
+                sub(/# handle [0-9]+$/, D h X, line)
+            }
+            if (index(line, "route_mobile6"))      line = M line X
+            else if (index(line, "route_china6") || index(line, "route_international6")) line = D line X
+            else if (index(line, "route_telecom6")) line = C line X
+            else if (index(line, "localnetwork6"))  line = D line X
+            printf "  %s\n", line
+        }'
+    sec_end
 }
 
 show_connections() {
-    echo "=== Active Connections by Mark ==="
+    sec "按标记统计的活动连接"
     echo
-    
-    # 先检查conntrack是否可用
+
+    # check conntrack availability
     if ! command -v conntrack >/dev/null 2>&1; then
-        echo "  Error: conntrack command not found"
+        echo "  错误：未找到 conntrack 命令"
         return 1
     fi
-    
-    # 显示按mark分组的连接数，排除局域网到局域网的连接
-    conntrack -L |grep -v ':' 2>/dev/null | awk '
+
+    # group connections by mark, skip lan-to-lan (v4 and v6)
+    conntrack -L 2>/dev/null | awk -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" -v D="$C_DIM" -v B="$C_BOLD" -v X="$C_RESET" '
     function is_private_ip(ip) {
-        # 检查是否为局域网IP
+        # private ip check (v4)
         if (ip ~ /^10\./) return 1
         if (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) return 1
         if (ip ~ /^192\.168\./) return 1
         if (ip ~ /^127\./) return 1
         if (ip ~ /^169\.254\./) return 1
+        # private ip check (v6)
+        if (ip ~ /^fe80:/) return 1
+        if (ip ~ /^f[cd][0-9a-f][0-9a-f]:/) return 1
+        if (ip == "::1") return 1
         return 0
     }
     {
-        # 提取src和dst IP地址
+        # extract src/dst
         src_ip = ""
         dst_ip = ""
         for (i = 1; i <= NF; i++) {
@@ -101,211 +500,480 @@ show_connections() {
                 dst_ip = $i
             }
         }
-        
-        # 如果src和dst都是局域网IP，跳过此连接
+        # skip lan-to-lan
         if (src_ip != "" && dst_ip != "" && is_private_ip(src_ip) && is_private_ip(dst_ip)) {
             next
         }
-        
-        # 直接搜索mark=数字的模式
+
+        # 线路位在 bit16-19；低16位可能是 OAF appid，高位可能是 OAF 状态。
         if (match($0, /mark=([0-9]+)/)) {
-            # 提取mark值
             for (i = 1; i <= NF; i++) {
                 if ($i ~ /^mark=/) {
                     gsub(/mark=/, "", $i)
-                    mark_value = $i + 0  # 转换为数字
+                    mark_value = $i + 0
                     break
                 }
             }
-            
-            # 按mark值分类
-            if (mark_value == 256) {
+
+            route_id = int(mark_value / 65536) % 16
+            if (route_id == 1) {
                 wan_count++
-            } else if (mark_value == 512) {
+            } else if (route_id == 2) {
                 vwan_count++
-            } else if (mark_value == 768) {
+            } else if (route_id == 3) {
                 iptv_count++
+            } else if (route_id == 4) {
+                cmcc_count++
             } else {
                 other_count++
                 other_marks[mark_value]++
             }
             total_count++
+            if (src_ip ~ /:/) v6_count++
         }
     }
     END {
-        # 显示统计结果
-        if (wan_count > 0) printf "  %-15s: %d connections\n", "WAN (0x100)", wan_count
-        if (vwan_count > 0) printf "  %-15s: %d connections\n", "VWAN1 (0x200)", vwan_count
-        if (iptv_count > 0) printf "  %-15s: %d connections\n", "IPTV (0x300)", iptv_count
+        if (wan_count > 0) printf "  %s%-15s%s: %d 条连接\n", BL, "WAN (0x00010000)", X, wan_count
+        if (vwan_count > 0) printf "  %s%-15s%s: %d 条连接\n", BL, "VWAN1 (0x00020000)", X, vwan_count
+        if (iptv_count > 0) printf "  %s%-15s%s: %d 条连接\n", YL, "IPTV (0x00030000)", X, iptv_count
+        if (cmcc_count > 0) printf "  %s%-15s%s: %d 条连接\n", MG, "VWAN2 (0x00040000)", X, cmcc_count
         if (other_count > 0) {
             for (mark in other_marks) {
                 if (mark == 0) {
-                    printf "  %-15s: %d connections\n", "Unmarked", other_marks[mark]
+                    printf "  %s%-15s%s: %d 条连接\n", D, "未标记", X, other_marks[mark]
                 } else {
-                    printf "  %-15s: %d connections\n", "Other (" mark ")", other_marks[mark]
+                    printf "  %s%-15s%s: %d 条连接\n", D, "其他 (" mark ")", X, other_marks[mark]
                 }
             }
         }
-        printf "  %-15s: %d connections\n", "Total", total_count
-        
-        # 如果没有找到任何带mark的连接，显示调试信息
+        printf "  %s%-15s%s: %d 条连接\n", B, "TOTAL", X, total_count
+        if (v6_count > 0) printf "  %-15s: %d 条连接\n", "其中 IPv6", v6_count
+
         if (total_count == 0) {
             print ""
-            print "Debug: No connections with marks found."
-            print "Sample conntrack output (first 3 lines):"
+            print "调试：未发现带标记的连接。"
+            print "conntrack 输出示例（前 3 行）："
             system("conntrack -L 2>/dev/null | head -3")
         }
     }'
 }
 
+# Clash 出站线路判定：用 Clash API 的 connections（含 sourcePort/destinationIP）
+# 与 conntrack 关联，只统计 Clash 自己的连接；conntrack 源地址是策略改写前的值，
+# 因此出口以 fwmark 为准。
+clash_api_connections() {
+    local port secret
+    port=$(uci -q get openclash.config.cn_port || echo 9090)
+    secret=$(grep -E '^secret:' /etc/openclash/config.yaml 2>/dev/null | awk '{print $2}')
+    [ -n "$secret" ] || return 1
+    curl -s -m 3 -H "Authorization: Bearer $secret" "http://127.0.0.1:$port/connections" 2>/dev/null
+}
+
+# 节点端点（隧道目标）→ 实际出口线路
+# Clash 把流量封装进隧道，conntrack 里只有到节点端点的连接，因此按端点判定出口。
+clash_node_lines() {
+    local ctf="$1" server
+
+    # 节点 server 字段（主配置 + 订阅提供者）→ 解析为 IP，按 IP 归并别名
+    server=$(grep -hE '^[[:space:]]*server:' /etc/openclash/config.yaml /etc/openclash/proxy_provider/*.yaml 2>/dev/null \
+        | awk '{print $2}' | tr -d '"' | sort -u)
+
+    : > /tmp/_clash_nodes.$$
+    for h in $server; do
+        case "$h" in
+            *[0-9].[0-9]*.[0-9]*.[0-9]*|*:*) printf '%s\t%s\n' "$h" "$h" >> /tmp/_clash_nodes.$$ ;;
+            *) nslookup "$h" 127.0.0.1 2>/dev/null | awk '/^Address: /{print $2}' | grep -vE '^127\.' | head -2 \
+                   | while read -r ip; do printf '%s\t%s\n' "$ip" "$h"; done >> /tmp/_clash_nodes.$$ ;;
+        esac
+    done
+
+    echo "  节点端点 → 出口线路（按当前连接数排序）："
+    awk -F'\t' '
+      { if ($1 == "") next
+        if (!($1 in names)) { names[$1] = $2 } else if (index(names[$1], $2) == 0) { names[$1] = names[$1] "," $2 } }
+      END { for (ip in names) print ip "|" names[ip] }
+    ' /tmp/_clash_nodes.$$ > /tmp/_clash_nodes2.$$
+
+    awk -F'|' '
+      function line_of(m,   route_id) {
+          route_id = int(m / 65536) % 16
+          if (route_id == 1) return "WAN   (0x00010000)"
+          if (route_id == 2) return "VWAN1 (0x00020000)"
+          if (route_id == 3) return "IPTV  (0x00030000)"
+          if (route_id == 4) return "VWAN2 (0x00040000)"
+          return "无连接/未标记"
+      }
+      NR == FNR {
+          m = $2 + 0
+          # 线路位在 bit16-19，低16位及高位可由 OAF 使用。
+          route_id = int(m / 65536) % 16
+          if (route_id < 1 || route_id > 4) next
+          cnt[$1 "|" m]++; total[$1]++
+          next
+      }
+      { ip = $1; name = $2
+        t = total[ip] + 0
+        if (t == 0) { printf "%d|%s|%s|%s\n", 0, ip, "-", name; next }
+        detail = ""
+        for (k in cnt) {
+            split(k, a, "|")
+            if (a[1] != ip) continue
+            lbl = line_of(a[2] + 0)
+            if (index(detail, lbl) == 0) detail = detail (detail == "" ? "" : " + ") lbl
+        }
+        printf "%d|%s|%s|%s\n", t, ip, detail, name
+      }' "$ctf" /tmp/_clash_nodes2.$$ | sort -t'|' -k1 -rn | awk -F'|' \
+        -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" \
+        -v D="$C_DIM" -v B="$C_BOLD" -v X="$C_RESET" '
+      function lc(l,   parts, i, out, one) {
+          split(l, parts, / \+ /)
+          out = ""
+          for (i = 1; i <= length(parts); i++) {
+              one = parts[i]
+              if (index(one, "VWAN2"))      out = out (out == "" ? "" : " + ") MG one X
+              else if (index(one, "VWAN1")) out = out (out == "" ? "" : " + ") CY one X
+              else if (index(one, "IPTV"))  out = out (out == "" ? "" : " + ") YL one X
+              else if (index(one, "WAN"))   out = out (out == "" ? "" : " + ") BL one X
+              else                          out = out (out == "" ? "" : " + ") D one X
+          }
+          return out
+      }
+      { if ($1 + 0 == 0) next
+        printf "    %s%-40s%s %s %s%4d%s   %s\n", D, $2, X, lc($3), B, $1, X, $4
+        shown++ }
+      END { if (shown == 0) print "    （当前没有活动的节点端点连接）" }'
+    rm -f /tmp/_clash_nodes.$$ /tmp/_clash_nodes2.$$
+}
+
+show_clash() {
+    local json ctf port secret
+
+    sec "Clash 出站线路判定"
+    echo
+
+    port=$(uci -q get openclash.config.cn_port || echo 9090)
+    secret=$(grep -E '^secret:' /etc/openclash/config.yaml 2>/dev/null | awk '{print $2}')
+    if [ -n "$secret" ]; then
+        printf '活动出站链（Clash API :%s）：\n' "$port"
+        curl -s -m 3 -H "Authorization: Bearer $secret" "http://127.0.0.1:$port/connections" 2>/dev/null \
+            | grep -o '"chains":\[[^]]*\]' | sort | uniq -c | sort -rn | head -8 | sed 's/^/  /'
+        echo
+    fi
+
+    ctf="/tmp/_clash_ct.$$"
+    conntrack -L 2>/dev/null | awk '
+        { d = ""; m = -1; dp = ""
+          for (i = 1; i <= NF; i++) {
+              if (d == "" && $i ~ /^dst=/) d = substr($i, 5)
+              if (dp == "" && $i ~ /^dport=/) dp = substr($i, 7)
+              if ($i ~ /^mark=/) { split($i, x, "="); m = x[2] + 0 }
+          }
+          if (d == "") next
+          print d "|" m
+        }' > "$ctf"
+    clash_node_lines "$ctf"
+    echo
+    echo "说明：Clash 出线由隧道目标（节点端点）决定，故按端点判定出口；"
+    echo "      0x00010000=WAN 0x00020000=VWAN1 0x00040000=VWAN2 0x00030000=IPTV；标记与端点路由一致才表示真正走该线。"
+    rm -f "$ctf"
+    sec_end
+}
+
 add_no_balance() {
     local ip="$1"
     if [ -z "$ip" ]; then
-        echo "Usage: $0 add-no-balance <ip_address>"
+        echo "用法：$0 add-no-balance <IP地址>"
         exit 1
     fi
-    
-    echo "Adding $ip to no-balance set..."
+
+    echo "正在将 $ip 添加到 no-balance 集合..."
     nft add element inet $NFT_TABLE no_balanced { $ip }
-    echo "Done."
+    echo "完成。"
+}
+
+add_iptv() {
+    local ip="$1"
+    if [ -z "$ip" ]; then
+        echo "用法：$0 add-iptv <IP地址>"
+        exit 1
+    fi
+
+    echo "正在将 $ip 添加到 iptv 集合..."
+    nft add element inet $NFT_TABLE iptv { $ip }
+    echo "完成。"
 }
 
 remove_no_balance() {
     local ip="$1"
     if [ -z "$ip" ]; then
-        echo "Usage: $0 remove-no-balance <ip_address>"
+        echo "用法：$0 remove-no-balance <IP地址>"
         exit 1
     fi
-    
-    echo "Removing $ip from no-balance set..."
+
+    echo "正在从 no-balance 集合移除 $ip ..."
     nft delete element inet $NFT_TABLE no_balanced { $ip }
-    echo "Done."
+    echo "完成。"
 }
 
 list_no_balance() {
-    echo "=== No-Balance IP List ==="
+    sec "不参与负载均衡 IP 列表"
     nft list set inet $NFT_TABLE no_balanced 2>/dev/null
+    sec_end
 }
 
 list_iptv_set() {
-    echo "=== IPTV IP Set ==="
+    sec "IPTV IP 集合"
     nft list set inet $NFT_TABLE iptv 2>/dev/null
+    sec_end
 }
 
 show_counters() {
-    echo "=== NFTables Rule Counters ==="
+    sec "NFTables 规则计数器"
     echo
-    
-    echo "PREROUTING Chain (转发流量):"
+
+    echo "PREROUTING 链："
     nft list chain inet $NFT_TABLE prerouting_hook | grep -E "counter|comment" | awk '{print NR-1". "$0}'
     echo
-    
-    echo "OUTPUT Chain (路由器自身流量):"
+
+    echo "OUTPUT 链："
     nft list chain inet $NFT_TABLE output_hook | grep -E "counter|comment" | awk '{print NR-1". "$0}'
     echo
-    
-    echo "SAVE_MARK Chain (标记保存):"
+
+    echo "SAVE_MARK 链："
     nft list chain inet $NFT_TABLE save_mark | grep -E "counter|comment" | awk '{print NR-1". "$0}'
     echo
 }
 
-show_balance_stats() {
-    echo "=== 负载均衡效果统计 ==="
-    echo
-    
-    # 提取各线路的包数和字节数
-    local wan_stats vwan_stats iptv_stats
-    wan_stats=$(nft list chain inet $NFT_TABLE save_mark | grep "WAN流量计数")
-    vwan_stats=$(nft list chain inet $NFT_TABLE save_mark | grep "VWAN1流量计数")
-    iptv_stats=$(nft list chain inet $NFT_TABLE save_mark | grep "IPTV流量计数")
-    
-    # 解析数据 - 使用awk提取数字
-    local wan_pkts wan_bytes vwan_pkts vwan_bytes iptv_pkts iptv_bytes
-    wan_pkts=$(echo "$wan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="packets") print $(i+1)}')
-    wan_bytes=$(echo "$wan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="bytes") print $(i+1)}')
-    vwan_pkts=$(echo "$vwan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="packets") print $(i+1)}')
-    vwan_bytes=$(echo "$vwan_stats" | awk '{for(i=1;i<=NF;i++) if($i=="bytes") print $(i+1)}')
-    iptv_pkts=$(echo "$iptv_stats" | awk '{for(i=1;i<=NF;i++) if($i=="packets") print $(i+1)}')
-    iptv_bytes=$(echo "$iptv_stats" | awk '{for(i=1;i<=NF;i++) if($i=="bytes") print $(i+1)}')
-    
-    # 设置默认值
-    [ -z "$wan_pkts" ] && wan_pkts=0
-    [ -z "$wan_bytes" ] && wan_bytes=0
-    [ -z "$vwan_pkts" ] && vwan_pkts=0
-    [ -z "$vwan_bytes" ] && vwan_bytes=0
-    [ -z "$iptv_pkts" ] && iptv_pkts=0
-    [ -z "$iptv_bytes" ] && iptv_bytes=0
-    
-    # 计算总数
-    local total_pkts total_bytes
-    total_pkts=$((wan_pkts + vwan_pkts + iptv_pkts))
-    total_bytes=$((wan_bytes + vwan_bytes + iptv_bytes))
-    
-    echo "流量分布统计:"
-    printf "  %-8s: %10s 包, %15s 字节", "WAN" "$wan_pkts" "$wan_bytes"
-    [ $total_pkts -gt 0 ] && printf " (%.1f%%)" $((wan_pkts * 100 / total_pkts))
-    echo
-    
-    printf "  %-8s: %10s 包, %15s 字节", "VWAN1" "$vwan_pkts" "$vwan_bytes"
-    [ $total_pkts -gt 0 ] && printf " (%.1f%%)" $((vwan_pkts * 100 / total_pkts))
-    echo
-    
-    printf "  %-8s: %10s 包, %15s 字节", "IPTV" "$iptv_pkts" "$iptv_bytes"
-    [ $total_pkts -gt 0 ] && printf " (%.1f%%)" $((iptv_pkts * 100 / total_pkts))
-    echo
-    
-    echo "  --------"
-    printf "  %-8s: %10s 包, %15s 字节\n" "总计" "$total_pkts" "$total_bytes"
-    echo
-    
-    # 负载均衡评估 (仅WAN+VWAN1)
-    local balance_pkts balance_bytes
-    balance_pkts=$((wan_pkts + vwan_pkts))
-    balance_bytes=$((wan_bytes + vwan_bytes))
-    
-    if [ $balance_pkts -gt 0 ]; then
-        echo "负载均衡评估 (WAN vs VWAN1):"
-        local wan_ratio vwan_ratio
-        wan_ratio=$((wan_pkts * 100 / balance_pkts))
-        vwan_ratio=$((vwan_pkts * 100 / balance_pkts))
-        printf "  WAN:   %d%% (%s包)\n" "$wan_ratio" "$wan_pkts"
-        printf "  VWAN1: %d%% (%s包)\n" "$vwan_ratio" "$vwan_pkts"
-        
-        # 均衡度评估
-        local diff=$((wan_ratio - vwan_ratio))
-        [ $diff -lt 0 ] && diff=$((-diff))
-        
-        if [ $diff -le 10 ]; then
-            echo "  均衡度: 优秀 (差异${diff}%)"
-        elif [ $diff -le 20 ]; then
-            echo "  均衡度: 良好 (差异${diff}%)"
-        elif [ $diff -le 30 ]; then
-            echo "  均衡度: 一般 (差异${diff}%)"
-        else
-            echo "  均衡度: 较差 (差异${diff}%)"
-        fi
-    else
-        echo "负载均衡评估: 暂无数据"
-    fi
-    echo
+# 读取某出口标记的累计计数，输出 "packets bytes"
+mark_totals() {
+    nft list chain inet $NFT_TABLE save_mark 2>/dev/null | awk -v m="$1" '
+        $0 ~ "meta mark " m {
+            for (i = 1; i <= NF; i++) { if ($i == "packets") p = $(i + 1) }
+            for (i = 1; i <= NF; i++) { if ($i == "bytes") b = $(i + 1) }
+            print p + 0, b + 0
+            exit
+        }'
 }
 
+show_balance_stats() {
+    local interval=${1:-5}
+
+    case "$interval" in
+        ''|*[!0-9]*) interval=5 ;;
+    esac
+
+    sec "负载均衡统计"
+    echo
+
+    subsec "累计计数（自规则表加载起，含历史）"
+    printf "  %-8s %14s %18s %11s\n" "exit" "packets" "bytes" "share"
+    awk -v w="$(mark_totals 0x00010000)" \
+        -v v1="$(mark_totals 0x00020000)" \
+        -v v2="$(mark_totals 0x00040000)" \
+        -v tv="$(mark_totals 0x00030000)" \
+        -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" \
+        -v G="$C_GREEN" -v Y="$C_YELLOW" -v R="$C_RED" -v B="$C_BOLD" -v D="$C_DIM" -v X="$C_RESET" '
+        function pad(n, w,   i, v, c, cols, out) {
+            for (i = 0; i < 256; i++) ORD[sprintf("%c", i)] = i
+            cols = 0
+            for (i = 1; i <= length(n); i++) {
+                v = ORD[substr(n, i, 1)]
+                if (v >= 192) cols += 2
+                else if (v < 128) cols += 1
+            }
+            out = n
+            for (i = cols; i < w; i++) out = out " "
+            return out
+        }
+        function lc(n,   p) {
+            p = pad(n, 8)
+            if (n == "WAN")   return BL p X
+            if (n == "VWAN1") return CY p X
+            if (n == "VWAN2") return MG p X
+            if (n == "IPTV")  return YL p X
+            return B p X
+        }
+        function pc(p,   c) { c = (p >= 35 ? G : (p >= 10 ? Y : R)); return c sprintf("%.1f%%", p) X }
+        function hb(b,   v) {
+            if (b >= 1073741824) return sprintf("%.2f GB", b / 1073741824)
+            if (b >= 1048576)    return sprintf("%.1f MB", b / 1048576)
+            if (b >= 1024)       return sprintf("%.1f KB", b / 1024)
+            return b " B"
+        }
+        function row(name, pair, denom, is_bal) {
+            split(pair, f)
+            printf "  %s %14s %s%18s%s", lc(name), f[1], G, hb(f[2]), X
+            if (denom > 0) {
+                d = sprintf("%10.1f%%", f[2] * 100 / denom)     # 先补齐纯文本
+                c = ((f[2] * 100 / denom) >= 35 ? G : ((f[2] * 100 / denom) >= 10 ? Y : R))
+                printf " %s%s%s", c, d, X
+            } else {
+                printf " %s", D "-" X
+            }
+            if (!is_bal) printf "  %s(不计入均衡比例)%s", D, X
+            print ""
+        }
+        BEGIN {
+            split(w, W); split(v1, V1); split(v2, V2); split(tv, T)
+            balanced = W[2] + V1[2] + V2[2]
+            row("WAN", w, balanced, 1)
+            row("VWAN1", v1, balanced, 1)
+            row("VWAN2", v2, balanced, 1)
+            row("TOTAL", (W[1] + V1[1] + V2[1]) " " balanced, balanced, 1)
+            row("IPTV", tv, balanced, 0)
+        }'
+    printf '  %s提示：累计值含历史且只计建连/未跟踪流量；判断实际占用请看“各出口实际速率”。%s\n' "$C_DIM" "$C_RESET"
+    echo
+
+    # 窗口增量：累计计数器无法就地清零时，用两次采样求差反映当前实际分配
+    local wan0 vwan10 vwan20 iptv0 wan1 vwan11 vwan21 iptv1
+    local dev_before pol_before dev_after pol_after
+    dev_snapshot() { grep -E 'pppoe-(wan|vwan1|vwan2|iptv):' /proc/net/dev 2>/dev/null | awk '{print $1, $2, $10}'; }
+    dev_before=$(mktemp "${TMPDIR:-/tmp}/multiwan-dev-b.XXXXXX")
+    pol_before=$(mktemp "${TMPDIR:-/tmp}/multiwan-pol-b.XXXXXX")
+    dev_after=$(mktemp "${TMPDIR:-/tmp}/multiwan-dev-a.XXXXXX")
+    pol_after=$(mktemp "${TMPDIR:-/tmp}/multiwan-pol-a.XXXXXX")
+    dev_snapshot > "$dev_before"
+    policy_branch_bytes > "$pol_before"
+    wan0=$(mark_totals 0x00010000 | awk '{print $2}')
+    vwan10=$(mark_totals 0x00020000 | awk '{print $2}')
+    vwan20=$(mark_totals 0x00040000 | awk '{print $2}')
+    iptv0=$(mark_totals 0x00030000 | awk '{print $2}')
+
+    echo "采样 ${interval} 秒..."
+    sleep "$interval"
+
+    dev_snapshot > "$dev_after"
+    policy_branch_bytes > "$pol_after"
+    wan1=$(mark_totals 0x00010000 | awk '{print $2}')
+    vwan11=$(mark_totals 0x00020000 | awk '{print $2}')
+    vwan21=$(mark_totals 0x00040000 | awk '{print $2}')
+    iptv1=$(mark_totals 0x00030000 | awk '{print $2}')
+
+    awk -v i="$interval" \
+        -v w="$((wan1 - wan0))" -v v1="$((vwan11 - vwan10))" \
+        -v v2="$((vwan21 - vwan20))" -v tv="$((iptv1 - iptv0))" \
+        -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" \
+        -v G="$C_GREEN" -v Y="$C_YELLOW" -v R="$C_RED" -v B="$C_BOLD" -v X="$C_RESET" '
+        function pc(p,   c) { c = (p >= 35 ? G : (p >= 10 ? Y : R)); return c sprintf("%.0f%%", p) X }
+        BEGIN {
+            total = w + v1 + v2
+            printf "近 %s 秒流量分布（仅建连/未跟踪流量的计数，非字节占比）：\n", i
+            printf "  %s%-8s%s %12.1f KB  %8.1f KB/s", BL, "WAN", X, w / 1024, w / 1024 / i
+            if (total > 0) printf "  (%s)", pc(w * 100 / total)
+            print ""
+            printf "  %s%-8s%s %12.1f KB  %8.1f KB/s", CY, "VWAN1", X, v1 / 1024, v1 / 1024 / i
+            if (total > 0) printf "  (%s)", pc(v1 * 100 / total)
+            print ""
+            printf "  %s%-8s%s %12.1f KB  %8.1f KB/s", MG, "VWAN2", X, v2 / 1024, v2 / 1024 / i
+            if (total > 0) printf "  (%s)", pc(v2 * 100 / total)
+            print ""
+            printf "  %s%-8s%s %12.1f KB  %8.1f KB/s\n", YL, "IPTV", X, tv / 1024, tv / 1024 / i
+            if (total == 0) print "  （该窗口内没有被标记的新流量）"
+        }'
+    echo
+
+    # 真实出口速率：以接口字节为准（上面的计数只反映建连/未跟踪流量）
+    echo "各出口实际速率（近 ${interval} 秒，以接口字节为准）："
+    awk -v i="$interval" -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" -v B="$C_BOLD" -v X="$C_RESET" '
+        NR == FNR { rx[$1] = $2; tx[$1] = $3; next }
+        function col(d,   c) { if (index(d, "vwan2")) c = MG; else if (index(d, "vwan1")) c = CY; else if (index(d, "iptv")) c = YL; else c = BL; return c }
+        { drx = $2 - rx[$1]; dtx = $3 - tx[$1]
+          printf "  %s%-14s%s RX %9.1f KB/s   TX %9.1f KB/s\n", col($1), $1, X, drx / 1024 / i, dtx / 1024 / i
+          trx += drx; ttx += dtx }
+        END { printf "  %s%-14s%s RX %9.1f KB/s   TX %9.1f KB/s\n", B, "TOTAL", X, trx / 1024 / i, ttx / 1024 / i }' \
+        "$dev_before" "$dev_after"
+    echo
+
+    # 目的地址策略分支占比（同一采样窗口）
+    awk -v i="$interval" -v G="$C_GREEN" -v Y="$C_YELLOW" -v R="$C_RED" -v B="$C_BOLD" -v D="$C_DIM" \
+        -v MG="$C_MAGENTA" -v CY="$C_CYAN" -v X="$C_RESET" '
+        function pc(p,   c) { c = (p >= 35 ? G : (p >= 10 ? Y : R)); return c sprintf("%.0f%%", p) X }
+        function colc(c,   s) { s = sprintf("%-22s", c)
+            if (index(c, "mobile") || index(c, "cloudflare")) return MG s X
+            if (index(c, "telecom")) return CY s X
+            return D s X }
+        BEGIN {
+            split("route_mobile route_telecom route_china route_international route_mobile6 route_telecom6 route_china6 route_international6", known, " ")
+        }
+        NR == FNR { before[$1] = $2; next }
+        { after[$1] = $2 }
+        END {
+            for (c in after) {
+                d = after[c] - before[c]
+                if (d < 0) d = 0
+                delta[c] = d
+                total += d
+            }
+            printf "目的地址策略占比（近 %s 秒）：\n", i
+            n = 0
+            for (k = 1; k <= 8; k++) {
+                c = known[k]
+                if (!(c in delta)) continue
+                printf "  %s %12.1f KB  %8.1f KB/s", colc(c), delta[c] / 1024, delta[c] / 1024 / i
+                if (total > 0) printf "  (%s)", pc(delta[c] * 100 / total)
+                print ""
+                n++
+            }
+            for (c in delta) {
+                seen = 0
+                for (k = 1; k <= 8; k++) if (known[k] == c) seen = 1
+                if (seen) continue
+                printf "  %-22s %12.1f KB  %8.1f KB/s", c, delta[c] / 1024, delta[c] / 1024 / i
+                if (total > 0) printf "  (%.0f%%)", delta[c] * 100 / total
+                print ""
+                n++
+            }
+            if (n == 0) print "  （该窗口内没有流量经过策略分支）"
+            if (total > 0) printf "  %s%-22s%s %12.1f KB  %8.1f KB/s  (100%%)\n", B, "TOTAL", X, total / 1024, total / 1024 / i
+            print "  说明：仅统计策略分支的计数，只反映建连/未跟踪流量（TCP 建连后即不再计数，UDP 隧道逐包计数），"
+            print "        因此不能当作字节占比；实际出口占用请看上面的“各出口实际速率”。"
+        }' "$pol_before" "$pol_after"
+    rm -f "$pol_before" "$pol_after" "$dev_before" "$dev_after"
+    sec_end
+}
+
+# 计数器无法就地清零时（部分内核对 reset counters 无效），用重载规则表归零
 reset_counters() {
-    echo "重置所有计数器..."
+    local before after
+
+    before=$(mark_totals 0x00010000 | awk '{print $2}')
+    echo "正在重置流量计数器..."
+
     nft reset counters table inet $NFT_TABLE 2>/dev/null
+    after=$(mark_totals 0x00010000 | awk '{print $2}')
+
+    if [ -n "$before" ] && [ -n "$after" ] && [ "$after" -ge "$before" ]; then
+        echo "  当前内核不支持就地清零，改为重载规则表（会短暂中断策略）..."
+        /etc/init.d/multiwan restart >/dev/null 2>&1
+    fi
+
     echo "计数器已重置"
 }
 
 flush_conntrack() {
-    echo "Flushing connection tracking table..."
+    echo "正在清空连接跟踪表..."
     conntrack -F 2>/dev/null
-    echo "Done."
+    echo "完成。"
+}
+
+show_legend() {
+    sec "配色说明（语义色板）"
+    printf '  %s线路标识%s：%sWAN%s / %sVWAN1%s / %sVWAN2%s / %sIPTV%s\n' \
+        "$C_BOLD" "$C_RESET" "$C_BLUE" "$C_RESET" "$C_CYAN" "$C_RESET" "$C_MAGENTA" "$C_RESET" "$C_YELLOW" "$C_RESET"
+    printf '  %s状态语义%s：%s正常(up/balanced/命中)%s / %s降级(wan_only 等)%s / %s异常(down/失败)%s\n' \
+        "$C_BOLD" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET"
+    printf '  %s比例阈值%s：%s≥35%%%s / %s10–35%%%s / %s<10%%%s\n' \
+        "$C_BOLD" "$C_RESET" "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET" "$C_RED" "$C_RESET"
+    printf '  %s其它%s：键名/标题加粗，次要说明与线框暗色\n' "$C_BOLD" "$C_RESET"
+    printf '  %s开关%s：非 TTY 自动关闭；FORCE_COLOR=1 强制开启；NO_COLOR=1 关闭\n' "$C_BOLD" "$C_RESET"
+    sec_end
 }
 
 restart_service() {
-    echo "Restarting Multi-WAN service..."
+    echo "正在重启 Multi-WAN 服务..."
     /etc/init.d/multiwan restart
-    echo "Done."
+    echo "完成。"
 }
 
 COMMAND="${1:-status}"
@@ -315,10 +983,14 @@ case "$COMMAND" in
         ;;
     "status")
         show_status
-        show_balance_stats
+        show_balance_stats "${2:-5}"
+        show_clash
         ;;
     "connections"|"conn")
         show_connections
+        ;;
+    "clash")
+        show_clash
         ;;
     "counters"|"cts")
         show_counters
@@ -326,8 +998,29 @@ case "$COMMAND" in
     "reset-counters"|"rst-cts")
         reset_counters
         ;;
+    "force-wan")
+        force_egress wan "$2"
+        ;;
+    "force-vwan1")
+        force_egress vwan1 "$2"
+        ;;
+    "force-vwan2")
+        force_egress vwan2 "$2"
+        ;;
+    "unforce")
+        unforce_egress "$2"
+        ;;
+    "legend"|"colors")
+        show_legend
+        ;;
+    "list-force"|"lst-force")
+        list_force
+        ;;
     "add-no-balance"|"add-nb")
         add_no_balance "$2"
+        ;;
+    "add-iptv"|"add-tv")
+        add_iptv "$2"
         ;;
     "remove-no-balance"|"rm-nb")
         remove_no_balance "$2"
@@ -342,23 +1035,30 @@ case "$COMMAND" in
         flush_conntrack
         ;;
     *)
-        echo "Multi-WAN Management Script"
+        echo "Multi-WAN 管理脚本"
         echo
-        echo "Usage: $0 [command]"
+        echo "用法：$0 [命令]"
         echo
-        echo "Commands:"
-        echo "  status                    Show multi-wan status (default)"
-        echo "  restart                   Restart multi-wan service"
-        echo "  connections|conn          Show active connections by interface"
-        echo "  counters|cts              Show NFTables rule counters"
-        echo "  reset-counters|rst-cts    Reset all NFTables counters"
-        echo "  add-no-balance|add-nb IP  Add IP to no-balance set (force VWAN1)"
-        echo "  remove-no-balance|rm-nb   IP Remove IP from no-balance set"
-        echo "  list-no-balance|lst-nb    List IPs in no-balance set"
-        echo "  list-iptv|lst-iptv        List IPs in IPTV set"
-        echo "  flush-conntrack|flsh-cts  Flush connection tracking table"
+        echo "命令："
+        echo "  status [秒]               显示多 WAN 状态（默认）；秒为均衡统计采样窗口，默认 5"
+        echo "  restart                   重启多 WAN 服务"
+        echo "  connections|conn          按接口显示活动连接"
+        echo "  clash                     显示 Clash 出站实际走哪条宽带"
+        echo "  counters|cts              显示 NFTables 规则计数器"
+        echo "  reset-counters|rst-cts    重置流量计数器（内核不支持就地清零时重载规则表）"
+        echo "  add-no-balance|add-nb IP  添加 IP 到 no-balance 集合（强制走 WAN）"
+        echo "  force-wan IP              指定 IP 固定走 WAN（IPv4/IPv6 自动选集合）"
+        echo "  force-vwan1 IP            指定 IP 固定走 VWAN1"
+        echo "  force-vwan2 IP            指定 IP 固定走 VWAN2（移动）"
+        echo "  unforce IP                从所有强制出口集合移除该 IP"
+        echo "  list-force|lst-force      列出强制出口 IP"
+        echo "  legend|colors             显示配色说明"
+        echo "  add-iptv|add-tv IP        添加 IP 到 iptv 集合"
+        echo "  remove-no-balance|rm-nb IP 从 no-balance 集合移除 IP"
+        echo "  list-no-balance|lst-nb    列出 no-balance 集合中的 IP"
+        echo "  list-iptv|lst-iptv        列出 IPTV 集合中的 IP"
+        echo "  flush-conntrack|flsh-cts  清空连接跟踪表"
         echo
         exit 1
         ;;
 esac
-

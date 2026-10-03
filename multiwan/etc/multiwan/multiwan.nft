@@ -1,9 +1,6 @@
 # Multi-WAN NFTables Rules
 # This file ensures idempotent loading
 
-add table inet multiwan
-flush table inet multiwan
-
 # 创建新表
 table inet multiwan {
     # 私有网络地址集合
@@ -40,15 +37,213 @@ table inet multiwan {
         timeout 10m
     }
 
+    set mobile_destinations {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+    set telecom_destinations {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+    set china_destinations {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    # Cloudflare IPv4 段固定经移动 eth2 / vwan2 出口。
+    set cloudflare_destinations {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 173.245.48.0/20, 103.21.244.0/22, 103.22.200.0/22,
+            103.31.4.0/22, 141.101.64.0/18, 108.162.192.0/18,
+            190.93.240.0/20, 188.114.96.0/20, 197.234.240.0/22,
+            198.41.128.0/17, 162.158.0.0/15, 104.16.0.0/13,
+            104.24.0.0/14, 172.64.0.0/13, 131.0.72.0/22 }
+    }
+
+    set localnetwork6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+        elements = { fe80::/10, fc00::/7, ff00::/8, ::1/128 }
+    }
+
+    set cloudflare6_destinations {
+        type ipv6_addr
+        flags interval
+        auto-merge
+        elements = { 2400:cb00::/32, 2606:4700::/32, 2803:f800::/32, 2a06:98c0::/29, 2c0f:f248::/32 }
+    }
+
+    # 强制出口集合：显式指定某个 IPv4/IPv6 目的地走哪条线，优先级高于所有目的地分类。
+    set force_wan {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    set force_vwan1 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    set force_vwan2 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    set force6_wan {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    set force6_vwan1 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    set force6_vwan2 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    # IPv6 目的地集合：仅用于路由器自身发出的 v6（转发 v6 不参与策略）。
+    set mobile6_destinations {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    set telecom6_destinations {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    set china6_destinations {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    # WireGuard UDP回包按入站公网PPPoE WAN固定出口与源地址；eth2/vwan2 为私网DHCP上游，不承载入站端点。
+    # MultiWAN 线路位占用 bit16-19；OAF 使用低16位及高位状态，不能整值覆盖 ct mark。
+    map special_udp_source_by_mark {
+        type mark : ipv4_addr
+        elements = { 0x00010000 : 113.65.21.18, 0x00020000 : 113.65.21.251 }
+    }
+    set special_udp_wan_51820 {
+        type ipv4_addr . inet_service
+        size 65535
+        flags dynamic, timeout
+        timeout 3m
+    }
+    set special_udp_vwan_51820 {
+        type ipv4_addr . inet_service
+        size 65535
+        flags dynamic, timeout
+        timeout 3m
+    }
+    set special_udp_wan_51821 {
+        type ipv4_addr . inet_service
+        size 65535
+        flags dynamic, timeout
+        timeout 3m
+    }
+    set special_udp_vwan_51821 {
+        type ipv4_addr . inet_service
+        size 65535
+        flags dynamic, timeout
+        timeout 3m
+    }
+
+    chain special_udp_raw_in {
+        type filter hook prerouting priority raw; policy accept;
+        iifname { "pppoe-wan", "pppoe-vwan1" } udp dport 51820 notrack
+    }
+
+    chain special_udp_capture {
+        type filter hook prerouting priority dstnat - 1; policy accept;
+        iifname "pppoe-wan" udp dport 51820 add @special_udp_wan_51820 { ip saddr . udp sport timeout 3m } delete @special_udp_vwan_51820 { ip saddr . udp sport }
+        iifname "pppoe-vwan1" udp dport 51820 add @special_udp_vwan_51820 { ip saddr . udp sport timeout 3m } delete @special_udp_wan_51820 { ip saddr . udp sport }
+        iifname "pppoe-wan" udp dport 51821 add @special_udp_wan_51821 { ip saddr . udp sport timeout 3m } delete @special_udp_vwan_51821 { ip saddr . udp sport }
+        iifname "pppoe-vwan1" udp dport 51821 add @special_udp_vwan_51821 { ip saddr . udp sport timeout 3m } delete @special_udp_wan_51821 { ip saddr . udp sport }
+    }
+    chain special_udp_raw_out {
+        type filter hook output priority raw; policy accept;
+        udp sport 51820 ip daddr . udp dport @special_udp_wan_51820 notrack
+        udp sport 51820 ip daddr . udp dport @special_udp_vwan_51820 notrack
+        udp sport 51820 ip daddr . udp dport @special_udp_wan_51821 notrack
+        udp sport 51820 ip daddr . udp dport @special_udp_vwan_51821 notrack
+    }
+
+    chain special_udp_output {
+        type route hook output priority mangle - 4; policy accept;
+        udp sport 51820 ip daddr . udp dport @special_udp_wan_51820 meta mark set 0x00010000 ip saddr set meta mark map @special_udp_source_by_mark
+        udp sport 51820 ip daddr . udp dport @special_udp_vwan_51820 meta mark set 0x00020000 ip saddr set meta mark map @special_udp_source_by_mark
+        udp sport 51820 ip daddr . udp dport @special_udp_wan_51821 meta mark set 0x00010000 ip saddr set meta mark map @special_udp_source_by_mark udp sport set 51821
+        udp sport 51820 ip daddr . udp dport @special_udp_vwan_51821 meta mark set 0x00020000 ip saddr set meta mark map @special_udp_source_by_mark udp sport set 51821
+    }
+
+    chain route_mobile6 {
+    }
+
+    chain route_telecom6 {
+    }
+
+    chain route_china6 {
+    }
+
+    chain route_mobile {
+        meta mark set 0x00040000 goto save_mark
+    }
+    chain route_telecom {
+        meta mark set jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 2 map { 0 : 0x00010000, 1 : 0x00020000 } goto save_mark
+    }
+    chain route_china {
+        meta mark set jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 3 map { 0 : 0x00010000, 1 : 0x00020000, 2 : 0x00040000 } goto save_mark
+    }
+    chain route_international {
+        meta mark set 0x00010000 goto save_mark
+    }
+
+
+
     # PREROUTING钩子 - 处理转发流量
+    chain route_international6 {
+    }
+
     chain prerouting_hook {
         type filter hook prerouting priority dstnat + 5; policy accept;
 
+        # 公网入口新连接固定回程WAN；仅更新线路位，保留 OAF appid/状态位。
+        iifname "pppoe-wan" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00010000 return
+        iifname "pppoe-vwan1" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00020000 return
+        iifname "pppoe-vwan2" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00040000 return
+        iifname "pppoe-iptv" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00030000 return
+        iifname { "pppoe-wan", "pppoe-iptv", "pppoe-vwan1", "pppoe-vwan2" } ct state established,related return
+
+        ip6 daddr @force6_wan counter meta mark set 0x00010000 goto save_mark
+        ip6 daddr @force6_vwan1 counter meta mark set 0x00020000 goto save_mark
+        ip6 daddr @force6_vwan2 counter meta mark set 0x00040000 goto save_mark
+        ip6 daddr @cloudflare6_destinations counter goto route_mobile6
         meta nfproto ipv6 counter return
 
         # --- 1. 跳过无需处理的流量 ---
         # 目标是路由器本身
         fib daddr type local counter return
+
+        # IPTV 目的地优先于接口跳过规则，保证 WG0/apifox 转发流量同样从 IPTV 口出去
+        iifname { "lo", "apifox", "WG0" } ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
 
         # 本地环回接口
         iifname { "lo", "apifox", "WG0" } counter return
@@ -58,35 +253,56 @@ table inet multiwan {
 
         # 安全检测
         meta mark != 0 ip saddr @localnetwork iifname != "lo" counter drop
-
         # 已有连接标记的流量
         ct state established,related meta mark set ct mark return
 
         # --- 2. 策略路由 (最高优先级) ---
         # TVBOX设备强制走IPTV
-        ip saddr 192.168.2.119 counter meta mark set 0x300 goto save_mark
+        ip saddr 192.168.1.153 counter meta mark set 0x00030000 goto save_mark
 
         # RTSP协议(554端口)走IPTV，并将目标IP加入IPTV集合
-        tcp dport 554 counter meta mark set 0x300 add @iptv { ip daddr } goto save_mark
+        tcp dport 554 counter meta mark set 0x00030000 add @iptv { ip daddr } goto save_mark
 
         # IPTV集合中的IP走IPTV
-        ip daddr @iptv counter meta mark set 0x300 goto save_mark
+        ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
 
-        # 不参与负载均衡的目标走VWAN
-        ip daddr @no_balanced counter meta mark set 0x100 goto save_mark
+        # 不参与负载均衡的目标走固定线路。
+        ip daddr @force_wan counter meta mark set 0x00010000 goto save_mark
+        ip daddr @force_vwan1 counter meta mark set 0x00020000 goto save_mark
+        ip daddr @force_vwan2 counter meta mark set 0x00040000 goto save_mark
+        ip daddr @no_balanced counter meta mark set 0x00010000 goto save_mark
+        # 不参与负载均衡的来源走 WAN。
+        ip saddr @no_balanced_src counter meta mark set 0x00010000 goto save_mark
 
-        # 不参与负载均衡的来源走WAN
-        ip saddr @no_balanced_src counter meta mark set 0x100 goto save_mark
-
-        # --- 3. 负载均衡 (默认规则) ---
-        # 使用五元组hash进行负载均衡，模拟RouterOS PCC
-        counter ct state new meta mark set jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 2 map { 0 : 0x100, 1 : 0x200 } goto save_mark
+        ip daddr @cloudflare_destinations counter goto route_mobile
+        ip daddr @mobile_destinations counter goto route_mobile
+        ip daddr @telecom_destinations counter goto route_telecom
+        ip daddr @china_destinations counter goto route_china
+        counter ct state new goto route_international
     }
 
     # OUTPUT钩子 - 处理路由器自身发出的流量
     chain output_hook {
         type route hook output priority mangle - 5; policy accept;
 
+        # 强制出口：显式指定目的地固定走某条线，优先于所有目的地分类与 ICMP 例外
+        ip daddr @force_wan counter meta mark set 0x00010000 goto save_mark
+        ip daddr @force_vwan1 counter meta mark set 0x00020000 goto save_mark
+        ip daddr @force_vwan2 counter meta mark set 0x00040000 goto save_mark
+
+        # IPTV 目的地走 IPTV 口：路由器自身流量此前无任何打标规则，会落到 main 表默认出口
+        ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
+
+        ip6 daddr @force6_wan counter meta mark set 0x00010000 goto save_mark
+        ip6 daddr @force6_vwan1 counter meta mark set 0x00020000 goto save_mark
+        ip6 daddr @force6_vwan2 counter meta mark set 0x00040000 goto save_mark
+        ip6 daddr @cloudflare6_destinations counter goto route_mobile6
+        ip6 daddr @localnetwork6 counter return
+        meta nfproto ipv6 ct state established,related meta mark set ct mark counter return
+        ip6 daddr @mobile6_destinations counter goto route_mobile6
+        ip6 daddr @telecom6_destinations counter goto route_telecom6
+        ip6 daddr @china6_destinations counter goto route_china6
+        meta nfproto ipv6 ct state new counter goto route_international6
         meta nfproto ipv6 counter return
 	meta l4proto icmp counter return
 
@@ -100,22 +316,34 @@ table inet multiwan {
         # 目标是内网地址
         ip daddr @localnetwork counter return
 
-        # --- 2. 负载均衡 (路由器自身发出的流量) ---
-        # 使用五元组hash进行负载均衡
-        counter ct state new meta mark set jhash ip saddr . ip daddr . meta l4proto . th sport . th dport mod 2 map { 0 : 0x100, 1 : 0x200 } goto save_mark
-
+        ip daddr @cloudflare_destinations counter goto route_mobile
+        ip daddr @mobile_destinations counter goto route_mobile
+        ip daddr @telecom_destinations counter goto route_telecom
+        ip daddr @china_destinations counter goto route_china
+        counter ct state new goto route_international
+    }
+    # IPv6 masquerade: policy reroute changes egress but source was pre-selected from main table; rewrite per-egress so router-originated IPv6 always matches the actual exit.
+    chain masq6_multiwan {
+        type nat hook postrouting priority srcnat; policy accept;
+        meta nfproto ipv6 oifname "pppoe-wan" meta mark 0x00010000 counter masquerade
+        meta nfproto ipv6 oifname "pppoe-vwan1" meta mark 0x00020000 counter masquerade
+        meta nfproto ipv6 oifname "pppoe-vwan2" meta mark 0x00040000 counter masquerade
     }
 
     # --- 统一的保存标记动作 ---
     chain save_mark {
-        # 先根据不同的mark值进行分别计数
-        meta mark 0x100 counter comment "WAN流量计数"
-        meta mark 0x200 counter comment "VWAN1流量计数"
-        meta mark 0x300 counter comment "IPTV流量计数"
-  
-        meta mark != 0x100 meta mark != 0x200 meta mark != 0x300 limit rate 1/minute log prefix "Unknown mark: "
-        # 最后保存mark到连接跟踪（带总计数器）
-        counter ct mark set meta mark comment "总流量计数"
+        # 线路位仅占 bit16-19；保存时保留 OAF appid 与其他 ct mark 状态。
+        meta mark 0x00010000 counter comment "WAN流量计数"
+        meta mark 0x00020000 counter comment "VWAN1流量计数"
+        meta mark 0x00030000 counter comment "IPTV流量计数"
+        meta mark 0x00040000 counter comment "VWAN2(移动)流量计数"
+
+        meta mark != 0x00010000 meta mark != 0x00020000 meta mark != 0x00030000 meta mark != 0x00040000 limit rate 1/minute log prefix "Unknown mark: "
+        counter comment "总流量计数"
+        meta mark 0x00010000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00010000 comment "保存WAN线路位"
+        meta mark 0x00020000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00020000 comment "保存VWAN1线路位"
+        meta mark 0x00030000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00030000 comment "保存IPTV线路位"
+        meta mark 0x00040000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00040000 comment "保存VWAN2线路位"
     }
 }
 

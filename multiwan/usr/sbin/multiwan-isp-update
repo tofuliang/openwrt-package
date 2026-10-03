@@ -1,0 +1,119 @@
+#!/bin/sh
+set -eu
+
+NFT_TABLE="${MULTIWAN_NFT_TABLE:-multiwan}"
+CACHE_ROOT="${MULTIWAN_CACHE_ROOT:-/etc/multiwan/isp}"
+CACHE_CURRENT="$CACHE_ROOT/current"
+TMP_DIR=''
+MOBILE_URL='https://ispip.clang.cn/cmcc_cidr.txt'
+TELECOM_URL='https://ispip.clang.cn/chinatelecom_cidr.txt'
+CHINA_URL='https://raw.githubusercontent.com/mayaxcn/china-ip-list/master/chnroute.txt'
+CLOUDFLARE_URL='https://www.cloudflare.com/ips-v4/'
+MOBILE6_URL='https://ispip.clang.cn/cmcc_ipv6.txt'
+TELECOM6_URL='https://ispip.clang.cn/chinatelecom_ipv6.txt'
+CHINA6_URL='https://ispip.clang.cn/all_cn_ipv6.txt'
+CLOUDFLARE6_URL='https://www.cloudflare.com/ips-v6/'
+
+cleanup() { [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"; }
+LOCK_FILE="${MULTIWAN_LOCK_DIR:-/var/lock}/multiwan_isp_update"
+mkdir -p "${LOCK_FILE%/*}"
+exec 9>"$LOCK_FILE"
+flock 9
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/multiwan-isp-update.XXXXXX") || exit 1
+trap cleanup EXIT INT TERM
+
+fetch() {
+    url="$1"; output="$2"
+    if command -v uclient-fetch >/dev/null 2>&1; then uclient-fetch -q -O "$output" "$url"
+    elif command -v wget >/dev/null 2>&1; then wget -qO "$output" "$url"
+    else echo 'uclient-fetch or wget is required' >&2; return 1; fi
+}
+valid_cidrs() { grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' "$1" > "$2"; [ -s "$2" ]; }
+valid_cidrs6() { grep -E '^[0-9a-fA-F:]+/[0-9]{1,3}$' "$1" > "$2"; [ -s "$2" ]; }
+
+write_batch() {
+    output="$1"; mobile="$2"; telecom="$3"; china="$4"; cloudflare="${5:-}"
+    mobile6="${6:-}"; telecom6="${7:-}"; china6="${8:-}"; cloudflare6="${9:-}"
+    {
+        printf 'flush set inet %s mobile_destinations\n' "$NFT_TABLE"
+        sed "s|^|add element inet $NFT_TABLE mobile_destinations { |; s|$| }|" "$mobile"
+        printf 'flush set inet %s telecom_destinations\n' "$NFT_TABLE"
+        sed "s|^|add element inet $NFT_TABLE telecom_destinations { |; s|$| }|" "$telecom"
+        printf 'flush set inet %s china_destinations\n' "$NFT_TABLE"
+        sed "s|^|add element inet $NFT_TABLE china_destinations { |; s|$| }|" "$china"
+        if [ -n "$cloudflare" ]; then
+            printf 'flush set inet %s cloudflare_destinations\n' "$NFT_TABLE"
+            sed "s|^|add element inet $NFT_TABLE cloudflare_destinations { |; s|$| }|" "$cloudflare"
+        fi
+        for pair in "mobile6_destinations:$mobile6" "telecom6_destinations:$telecom6" "china6_destinations:$china6" "cloudflare6_destinations:$cloudflare6"; do
+            set_name="${pair%%:*}"; set_file="${pair#*:}"
+            [ -n "$set_file" ] || continue
+            printf 'flush set inet %s %s\n' "$NFT_TABLE" "$set_name"
+            sed "s|^|add element inet $NFT_TABLE $set_name { |; s|$| }|" "$set_file"
+        done
+    } > "$output"
+}
+
+apply() {
+    [ -s "$CACHE_CURRENT" ] || { echo 'operator CIDR cache is incomplete' >&2; return 1; }
+    version=$(cat "$CACHE_CURRENT")
+    version_dir="$CACHE_ROOT/versions/$version"
+    mobile="$version_dir/mobile.cidr"; telecom="$version_dir/telecom.cidr"; china="$version_dir/china.cidr"
+    [ -s "$mobile" ] && [ -s "$telecom" ] && [ -s "$china" ] || { echo 'operator CIDR cache is incomplete' >&2; return 1; }
+    # 可选集合：旧缓存可能没有对应文件，缺哪个就跳过哪个集合。
+    optional_set() {
+        [ -s "$version_dir/$1.cidr" ] && printf '%s\n' "$version_dir/$1.cidr"
+    }
+    write_batch "$TMP_DIR/apply.nft" "$mobile" "$telecom" "$china" \
+        "$(optional_set cloudflare)" "$(optional_set mobile6)" "$(optional_set telecom6)" \
+        "$(optional_set china6)" "$(optional_set cloudflare6)"
+    nft -c -f "$TMP_DIR/apply.nft"
+    nft -f "$TMP_DIR/apply.nft"
+}
+
+# 只保留当前版本：回滚在同一次 update 内完成（失败时把指针写回旧版本名），无需长期留存旧目录。
+prune_versions() {
+    keep_new="$1"
+    [ -d "$CACHE_ROOT/versions" ] || return 0
+    for dir in "$CACHE_ROOT/versions"/*; do
+        [ -d "$dir" ] || continue
+        [ "${dir##*/}" = "$keep_new" ] && continue
+        rm -rf "$dir"
+    done
+}
+
+update() {
+    mkdir -p "$CACHE_ROOT/versions"
+    fetch "$MOBILE_URL" "$TMP_DIR/mobile.raw"; fetch "$TELECOM_URL" "$TMP_DIR/telecom.raw"; fetch "$CHINA_URL" "$TMP_DIR/china.raw"; fetch "$CLOUDFLARE_URL" "$TMP_DIR/cloudflare.raw"
+    valid_cidrs "$TMP_DIR/mobile.raw" "$TMP_DIR/mobile.cidr"; valid_cidrs "$TMP_DIR/telecom.raw" "$TMP_DIR/telecom.cidr"; valid_cidrs "$TMP_DIR/china.raw" "$TMP_DIR/china.cidr"; valid_cidrs "$TMP_DIR/cloudflare.raw" "$TMP_DIR/cloudflare.cidr"
+    [ "$(wc -l < "$TMP_DIR/mobile.cidr")" -ge 100 ]; [ "$(wc -l < "$TMP_DIR/telecom.cidr")" -ge 100 ]; [ "$(wc -l < "$TMP_DIR/china.cidr")" -ge 1000 ]; [ "$(wc -l < "$TMP_DIR/cloudflare.cidr")" -ge 10 ]
+    fetch "$MOBILE6_URL" "$TMP_DIR/mobile6.raw"; fetch "$TELECOM6_URL" "$TMP_DIR/telecom6.raw"; fetch "$CHINA6_URL" "$TMP_DIR/china6.raw"; fetch "$CLOUDFLARE6_URL" "$TMP_DIR/cloudflare6.raw"
+    valid_cidrs6 "$TMP_DIR/mobile6.raw" "$TMP_DIR/mobile6.cidr"; valid_cidrs6 "$TMP_DIR/telecom6.raw" "$TMP_DIR/telecom6.cidr"; valid_cidrs6 "$TMP_DIR/china6.raw" "$TMP_DIR/china6.cidr"; valid_cidrs6 "$TMP_DIR/cloudflare6.raw" "$TMP_DIR/cloudflare6.cidr"
+    [ "$(wc -l < "$TMP_DIR/mobile6.cidr")" -ge 10 ]; [ "$(wc -l < "$TMP_DIR/telecom6.cidr")" -ge 10 ]; [ "$(wc -l < "$TMP_DIR/china6.cidr")" -ge 100 ]; [ "$(wc -l < "$TMP_DIR/cloudflare6.cidr")" -ge 5 ]
+    old_version=''; [ -s "$CACHE_CURRENT" ] && old_version=$(cat "$CACHE_CURRENT")
+    version="$(date +%Y%m%d%H%M%S).$$"; version_dir="$CACHE_ROOT/versions/$version"; mkdir -p "$version_dir"
+    for name in mobile telecom china cloudflare mobile6 telecom6 china6 cloudflare6; do
+        mv "$TMP_DIR/$name.cidr" "$version_dir/$name.cidr"
+    done
+    write_batch "$TMP_DIR/apply.nft" "$version_dir/mobile.cidr" "$version_dir/telecom.cidr" "$version_dir/china.cidr" "$version_dir/cloudflare.cidr" "$version_dir/mobile6.cidr" "$version_dir/telecom6.cidr" "$version_dir/china6.cidr" "$version_dir/cloudflare6.cidr"
+    nft -c -f "$TMP_DIR/apply.nft"
+    # nft 运行态与 current 文件无法组成跨系统事务；先提交指针，崩溃后重跑 apply 可收敛到新缓存。
+    printf '%s\n' "$version" > "$CACHE_ROOT/current.new.$$"
+    mv -f "$CACHE_ROOT/current.new.$$" "$CACHE_CURRENT"
+    if ! nft -f "$TMP_DIR/apply.nft"; then
+        # nft 单文件应用失败时不提交任何集合变更；恢复或移除本次指针。
+        if [ -n "$old_version" ]; then
+            if [ "$(cat "$CACHE_CURRENT" 2>/dev/null)" = "$version" ]; then
+                printf '%s\n' "$old_version" > "$CACHE_ROOT/current.rollback.$$"
+                mv -f "$CACHE_ROOT/current.rollback.$$" "$CACHE_CURRENT"
+            fi
+        elif [ "$(cat "$CACHE_CURRENT" 2>/dev/null)" = "$version" ]; then
+            rm -f "$CACHE_CURRENT"
+        fi
+        rm -rf "$version_dir"
+        return 1
+    fi
+    prune_versions "$version"
+}
+
+case "${1:-update}" in update) update ;; apply) apply ;; *) echo "Usage: $0 [update|apply]" >&2; exit 1 ;; esac

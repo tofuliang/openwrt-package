@@ -10,13 +10,8 @@ case "$INTERFACE" in
     wan)
         # WAN接口事件处理
         if [ "$ACTION" = "ifup" ]; then
-            log "multiwan-hotplug" "Interface $INTERFACE is up, updating routes and status immediately"
-            # 立即标记接口为up状态
-            update_interface_status "$INTERFACE" "up" "hotplug"
-            # 延迟2秒确保接口完全就绪后更新路由表
-            (sleep 2; setup_route "$INTERFACE" "100") &
-            # 通知tracker立即检查
-            notify_tracker "$INTERFACE"
+            log "multiwan-hotplug" "Interface $INTERFACE is up; waiting for policy route"
+            (sleep 2; setup_route "$INTERFACE" "100" && update_interface_status "$INTERFACE" "up" "hotplug" && { update_special_udp_source "$INTERFACE" || log "multiwan-hotplug" "Warning: failed to refresh WireGuard source address for $INTERFACE"; } && notify_tracker "$INTERFACE") &
         elif [ "$ACTION" = "ifdown" ]; then
             log "multiwan-hotplug" "Interface $INTERFACE is down, updating status immediately"
             # 立即标记接口为down状态并更新路由
@@ -28,10 +23,19 @@ case "$INTERFACE" in
     vwan1)
         # VWAN接口事件处理
         if [ "$ACTION" = "ifup" ]; then
-            log "multiwan-hotplug" "Interface $INTERFACE is up, updating routes and status immediately"
-            update_interface_status "$INTERFACE" "up" "hotplug"
-            (sleep 2; setup_route "$INTERFACE" "200") &
+            log "multiwan-hotplug" "Interface $INTERFACE is up; waiting for policy route"
+            (sleep 2; setup_route "$INTERFACE" "200" && update_interface_status "$INTERFACE" "up" "hotplug" && { update_special_udp_source "$INTERFACE" || log "multiwan-hotplug" "Warning: failed to refresh WireGuard source address for $INTERFACE"; } && notify_tracker "$INTERFACE") &
+        elif [ "$ACTION" = "ifdown" ]; then
+            log "multiwan-hotplug" "Interface $INTERFACE is down, updating status immediately"
+            update_interface_status "$INTERFACE" "down" "hotplug"
             notify_tracker "$INTERFACE"
+        fi
+        ;;
+    vwan2)
+        # 中国移动接口事件处理
+        if [ "$ACTION" = "ifup" ]; then
+            log "multiwan-hotplug" "Interface $INTERFACE is up; waiting for policy route"
+            (sleep 2; setup_route "$INTERFACE" "400" && update_interface_status "$INTERFACE" "up" "hotplug" && notify_tracker "$INTERFACE") &
         elif [ "$ACTION" = "ifdown" ]; then
             log "multiwan-hotplug" "Interface $INTERFACE is down, updating status immediately"
             update_interface_status "$INTERFACE" "down" "hotplug"
@@ -41,14 +45,17 @@ case "$INTERFACE" in
     iptv)
         # IPTV接口事件处理
         if [ "$ACTION" = "ifup" ]; then
-            log "multiwan-hotplug" "IPTV interface $INTERFACE is up, updating routes"
-            update_interface_status "$INTERFACE" "up" "hotplug"
-            (sleep 2; setup_route "$INTERFACE" "300") &
-            notify_tracker "$INTERFACE"
+            log "multiwan-hotplug" "IPTV interface $INTERFACE is up; waiting for policy route"
+            (sleep 2; setup_route "$INTERFACE" "300" && update_interface_status "$INTERFACE" "up" "hotplug" && notify_tracker "$INTERFACE") &
         elif [ "$ACTION" = "ifdown" ]; then
             log "multiwan-hotplug" "IPTV interface $INTERFACE is down"
             update_interface_status "$INTERFACE" "down" "hotplug"
             notify_tracker "$INTERFACE"
         fi
+        ;;
+
+    wan_6|vwan1_6|vwan2_6)
+        # IPv6地址/前缀变化时重选本机无源IPv6默认路由。
+        ensure_ipv6_host_default || log "multiwan-ipv6" "Warning: failed to refresh host IPv6 default route after $INTERFACE $ACTION"
         ;;
 esac

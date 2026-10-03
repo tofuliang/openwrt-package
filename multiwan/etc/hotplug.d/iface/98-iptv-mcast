@@ -1,0 +1,28 @@
+#!/bin/sh
+# 为 IPTV 组播指定出口接口。
+#
+# 内核按"到组地址的路由"选择发送 IGMP 入组请求的接口；主表默认路由在
+# pppoe-vwan2 时，入组请求会被发到移动线，ISP 收不到 → 组播永不投递。
+# 这里只对 IPTV 使用的组播网段加路由，避免影响 LAN 内的 SSDP(239.255.255.250)。
+
+IPTV_IFACE="${IPTV_IFACE:-pppoe-iptv}"
+IPTV_MCAST_NETS="${IPTV_MCAST_NETS:-239.77.0.0/24 239.77.1.0/24 239.253.43.0/24 239.0.10.0/24}"
+
+case "$INTERFACE" in
+    iptv)
+        case "$ACTION" in
+            ifup)
+                sleep 2
+                for net in $IPTV_MCAST_NETS; do
+                    ip route replace "$net" dev "$IPTV_IFACE" 2>/dev/null \
+                        && logger -t multiwan-iptv "Multicast route $net -> $IPTV_IFACE"
+                done
+                ;;
+            ifdown)
+                for net in $IPTV_MCAST_NETS; do
+                    ip route del "$net" dev "$IPTV_IFACE" 2>/dev/null
+                done
+                ;;
+        esac
+        ;;
+esac

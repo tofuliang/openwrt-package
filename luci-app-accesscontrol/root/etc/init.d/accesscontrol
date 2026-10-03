@@ -332,11 +332,7 @@ EOF
 	debug_log "Loading and applying access control rules"
 	add_rules
 	
-	debug_log "Starting procd instance"
-	procd_open_instance
-	procd_set_param command /bin/true
-	procd_set_param respawn
-	procd_close_instance
+	debug_log "Accesscontrol is a one-shot firewall setup; no resident process required"
 	
 	debug_log "Accesscontrol service started successfully"
 }

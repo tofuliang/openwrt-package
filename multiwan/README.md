@@ -1,6 +1,6 @@
 # OpenWrt multiwan（HomeRouter）
 
-从 `root@192.168.2.1` **只读** 拉取的自定义三 WAN 负载均衡脚本。本仓库不写回远程。
+本仓库保存路由器的多 WAN 自定义脚本；`etc/config/` 已被 Git 忽略，本地若有配置文件也只是未纳入版本控制的私有副本，**路由器上的 `/etc/config/` 才是现网配置的权威来源**。本仓库不提供可复现的整机配置或配置备份。远程变更需按维护流程明确执行，不能把本地文件视作自动部署。IPTV 组播热插拔、rtp2httpd 和防火墙规则已在现网应用，后续同步时按下文仅更新对应项。
 
 ## 路径对照
 
@@ -11,11 +11,11 @@
 | `lib/multiwan_common.sh` | `/lib/multiwan_common.sh` |
 | `etc/init.d/multiwan` | `/etc/init.d/multiwan` |
 | `etc/hotplug.d/iface/99-multiwan` | `/etc/hotplug.d/iface/99-multiwan` |
+| `etc/hotplug.d/iface/98-iptv-mcast` | `/etc/hotplug.d/iface/98-iptv-mcast` |
 | `etc/multiwan/multiwan.nft` | `/etc/multiwan/multiwan.nft` |
-| `etc/config/multiwan` | `/etc/config/multiwan` |
 | `usr/sbin/multiwan-isp-update` | `/usr/sbin/multiwan-isp-update` |
 
-`etc/config/network`、`mwan3`、`syncdial` 是快照，实际负载均衡走 `multiwan`，不走 mwan3。
+`/etc/config/network` 等配置仅以路由器现网文件为准；本地 `etc/config/` 即使存在也不受版本控制，不可作为部署或回滚依据。实际负载均衡走 `multiwan`，不走 mwan3。
 
 ## 中国移动（vwan2）
 
@@ -27,7 +27,7 @@
 - IPTV 不参与三线均衡
 - 故障降级：三线 → 任意两线 hash → 单线 redirect
 
-拨号占位：`etc/config/network.vwan2.snippet`（账号密码未填，禁止提交真实口令到公开远程）。
+在路由器上配置 `vwan2` PPPoE；账号和口令仅保存在路由器的私有配置中，不要提交到公开仓库。
 
 线路标记写入 conntrack 时使用常量 RHS：`(ct mark and 0xfff0ffff) or <线路标记>`。这样兼容 Linux 6.12，不依赖双变量 bitwise；低16位及高位 OAF 状态不会被 MultiWAN 覆盖。
 
@@ -91,7 +91,7 @@ ip -4 route get 183.59.59.26 mark 0x00030000
 - `tools/adguard-window-attrib.sh`：统计 AdGuardHome 查询日志中**最近指定窗口全部** A 应答 IP 的多 WAN 归属，输出集合命中明细、出口口径汇总（vwan2 / wan+vwan1 / 三线哈希）、各归属域名样例与查询量 top10。
   ```sh
   sh tools/adguard-window-attrib.sh [窗口起点UTC前缀] [排除的客户端IP]
-  # 缺省窗口 = 最近 24 小时；缺省排除 192.168.20.22
+  # 缺省窗口 = 最近 24 小时；缺省排除地址见脚本配置
   ADGUARD_QUERYLOG=...  DNSDEC=...   # 可覆盖路径
   ```
 - `tools/dnsdec-all.awk`：批处理解码器，输入 `域名|base64应答`，输出 `域名|IP`。在 awk 内完成 base64 解码与 DNS 报文解析（压缩指针、RR 头 10 字节），无需逐条 fork openssl/hexdump。
@@ -116,15 +116,41 @@ multiwan list-force           # 列出
 
 ## IPTV 组播出口（rtp2httpd / msd_lite）
 
-内核按"到组地址的路由"选择发送 IGMP 入组请求的接口。若主表默认路由落在 `pppoe-vwan2`（移动），入组请求会被发到移动线，ISP 收不到，组播永不投递。
+`iptv` 是 PPPoE 单播接口：`pppoe-iptv`、`@iptv` 标记和策略表 300 继续服务播放列表 HTTP 等单播流量，**不要**把这些策略切到 IPoE。`iptvipoe` 才是 IPTV 组播接口；当前路由器的 L3 设备 `iptv_ipoe` 是建立在 `eth1.45` 上的 macvlan。以路由器 `/etc/config/network` 为准，保留现有 `iptv` PPPoE 配置，并确保 `iptvipoe` 已按运营商提供的 DHCP 参数绑定 `iptv_ipoe`。不要用未跟踪的本地配置覆盖现网，也不要猜测或提交 DHCP 认证参数。
 
-`etc/hotplug.d/iface/98-iptv-mcast` 在 `iptv` 接口 up 时为 IPTV 使用的组播网段固定路由（可用 `IPTV_MCAST_NETS` 覆盖）：
+内核按“到组地址的路由”选择发送 IGMP 入组请求的接口。若主表默认路由落在 `pppoe-vwan2`（移动），入组请求会发到移动线，ISP 收不到，组播永不投递。`etc/hotplug.d/iface/98-iptv-mcast` **仅**响应 `iptvipoe` 的 ifup/ifdown，将下列四段组播路由加入/移出主表的 `iptv_ipoe` 设备；即使 ifdown 时接口状态已从 ubus 消失，也按固定设备名删除（设备名不同可用 `IPTV_MCAST_IFACE` 覆盖）：
 
 ```sh
-ip route replace 239.77.0.0/24 dev pppoe-iptv   # 以及 239.77.1.0/24 239.253.43.0/24 239.0.10.0/24
+ip -4 route show 239.77.0.0/24    # dev iptv_ipoe
+# 其余：239.77.1.0/24、239.253.43.0/24、239.0.10.0/24
 ```
 
-只加这些网段而不是整段 `239.0.0.0/8`，避免把 LAN 内的 SSDP（239.255.255.250）也带去 WAN。防火墙侧需要放行 `iifname pppoe-iptv` 的 IGMP 与 UDP 组播（现有 `Allow IPTV` 规则已覆盖）。
+可用 `IPTV_MCAST_NETS` 覆盖组播网段；默认不添加整段 `239.0.0.0/8`，以免 LAN 内 SSDP（239.255.255.250）等非 IPTV 组播被带去 WAN。现网 `/etc/config/rtp2httpd` 启用 `advanced_interface_settings` 后，`upstream_interface_multicast=iptv_ipoe` 只负责组播，`upstream_interface_fcc=pppoe-iptv`、`upstream_interface_rtsp=pppoe-iptv` 保留单播快速换台和 RTSP；不再使用统一的 `upstream_interface`。msd_lite 如有使用也须从 IPoE 接收组播。
+
+现网 `Allow-IGMP` 放行 IGMP；`/etc/config/firewall` 中的 `Allow IPTV multicast` 仅允许来自 wan zone、进入 `iptv_ipoe` 的 IPv4 UDP 5146 发往上述四段组播地址。仅放行单个组播地址的 UDP 5146 时，其他频道虽能在 `iptv_ipoe` 抓到 UDP 包，rtp2httpd 仍会返回 HTTP 503；放行相应组播目标后可收到直播数据。不要全量放开 WAN 组播，也不要删除 PPPoE 单播所需的规则。
+
+### 手动同步 IPTV 服务及防火墙
+
+现网已应用上述配置，**无需再次部署**。日后人工对齐时，先备份路由器现有 `/etc/config/firewall` 与 `/etc/config/rtp2httpd`，直接检查路由器上的配置，不依赖本地忽略的 `etc/config/` 文件。确认只需调整 rtp2httpd 时，核对 `advanced_interface_settings` 和上述三种接口各自的用途，仅修改该服务需要的字段。保持 `/etc/config/network` 的 `iptv` PPPoE、路由表 300、`iptvipoe` 的运营商 DHCP 参数及任何认证密钥不变。
+
+对 `/etc/config/firewall` **只编辑单条规则**：按 `option name 'Allow IPTV multicast'` 找到对应的 `config rule` 段（现网为匿名段），检查来源为 wan zone、IPv4 UDP、目标端口 5146、`direction 'in'`、`device 'iptv_ipoe'`，以及四条 `list dest_ip`：`239.77.0.0/24`、`239.77.1.0/24`、`239.253.43.0/24`、`239.0.10.0/24`。不要用本地文件覆盖整份防火墙配置，也不要假设它始终是 `@rule[11]`。若无同名规则，才在现网配置中添加一条符合上述条件的规则；若发现多条同名规则，先检查并人工合并重复项为一条，不要继续追加。重复同步仍只更新这同一条规则。保持现有 `Allow-IGMP`、其他防火墙规则与 zone 不变；核对保存的文件中恰好一条同名规则且四段目标地址齐全后，在维护窗口重载防火墙与 rtp2httpd（仅当修改对应配置时）。
+
+部署后分别检查 IPoE 接口与组播路由，以及 PPPoE 单播策略（在维护窗口切换 `iptvipoe`，避免中断播放）：
+
+```sh
+ubus call network.interface.iptvipoe status  # up=true，l3_device=iptv_ipoe
+mcast_nets='239.77.0.0/24 239.77.1.0/24 239.253.43.0/24 239.0.10.0/24'
+for net in $mcast_nets; do ip -4 route show "$net"; done  # 四条均为 dev iptv_ipoe
+ip -4 route show table 300                    # PPPoE 默认路由仍为 pppoe-iptv
+ip -4 route get 183.59.59.26 mark 0x00030000 # dev pppoe-iptv
+ifdown iptvipoe
+for net in $mcast_nets; do ip -4 route show "$net"; done  # 四条均不再存在
+ip -4 route show table 300                    # PPPoE 路由不变
+ifup iptvipoe
+for net in $mcast_nets; do ip -4 route show "$net"; done  # 四条恢复
+```
+
+本地回归：`bash tests/iptv_mcast_hotplug_test.sh`（模拟 ifup/ifdown，不操作真实路由）。
 
 ## IPTV 单播出口（WG0/apifox 转发与路由器自身）
 

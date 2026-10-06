@@ -22,6 +22,13 @@ table inet multiwan {
         elements = { 183.59.57.50, 183.59.59.26 }
     }
 
+    # 移动 IPTV HTTP 服务；IP 与端口成对维护，避免误分流同一主机的其他端口。
+    set cmcc_iptv_services {
+        type ipv4_addr . inet_service
+        elements = { 183.235.16.92 . 8081, 183.235.16.92 . 8082,
+                     183.235.162.80 . 6610 }
+    }
+
     # 不参与负载均衡的来源IP集合
     set no_balanced_src {
         type ipv4_addr
@@ -258,8 +265,7 @@ table inet multiwan {
         # The legacy Telecom TVBOX source keeps its existing IPTV policy.
         # Classify before tunnel-interface bypass and ct mark restore so
         # forwarded and established CMCC sessions stay on IPoE.
-        ip saddr != 192.168.1.153 ip daddr 183.235.16.92 tcp dport { 8081, 8082 } counter meta mark set 0x00050000 goto save_mark
-        ip saddr != 192.168.1.153 ip daddr 183.235.162.80 tcp dport 6610 counter meta mark set 0x00050000 goto save_mark
+        ip saddr != 192.168.1.153 ip daddr . tcp dport @cmcc_iptv_services counter meta mark set 0x00050000 goto save_mark
 
         # Legacy IPTV destinations also cover VPN/loopback forwarded traffic.
         iifname { "lo", "apifox", "WG0" } ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
@@ -301,8 +307,7 @@ table inet multiwan {
         ip daddr @force_vwan1 counter meta mark set 0x00020000 goto save_mark
         ip daddr @force_vwan2 counter meta mark set 0x00040000 goto save_mark
         # Catalog/EPG/logos and replay use the CMCC IPTV DHCP gateway.
-        ip daddr 183.235.16.92 tcp dport { 8081, 8082 } counter meta mark set 0x00050000 goto save_mark
-        ip daddr 183.235.162.80 tcp dport 6610 counter meta mark set 0x00050000 goto save_mark
+        ip daddr . tcp dport @cmcc_iptv_services counter meta mark set 0x00050000 goto save_mark
 
 
         # IPTV 目的地走 IPTV 口：路由器自身流量此前无任何打标规则，会落到 main 表默认出口

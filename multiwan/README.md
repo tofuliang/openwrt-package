@@ -137,6 +137,8 @@ ip -4 route show 239.77.0.0/24    # dev iptv_ipoe
 
 移动 IPTV 的 `cmccitv` 是 `eth2.48` 上的 DHCP/IPoE 接口，**不同于**通用移动宽带 `vwan2`（表 400）和电信 IPTV `iptv`（表 300）。multiwan 为它单独维护 IPv4 表 500、标记 `0x00050000` 与优先级 2005 的规则；路由器自身及 LAN 客户端访问频道/节目单/台标 `183.235.16.92:8081,8082`、中兴回看 `183.235.162.80:6610` 时走 `cmccitv`，显式 `force-*` 规则仍优先。DHCP 默认路由被网络配置禁用时，从 netifd 报告的 inactive 默认路由读取网关；接口或网关不可用时对这些目的地拒绝转发，不回退到普通移动宽带或电信出口。
 
+这些 HTTP 目标集中在 NFT 集合 `cmcc_iptv_services` 中，以 **IP + TCP 端口**成对记录：`183.235.16.92` 的 8081/8082 及 `183.235.162.80` 的 6610。修改运营商地址时更新 `etc/multiwan/multiwan.nft` 的 `elements` 并按部署流程重载；临时 `nft add element inet multiwan cmcc_iptv_services '{ <IP> . <端口> }'` 只作用于当前规则表，重启不会保留。成对匹配避免把回看服务器的 8082 或节目单服务器的 6610 误当 IPTV 服务。
+
 运营商频道列表中的移动直播组播落在 `239.10.0.0/24`、`239.11.0.0/24`、`239.20.0.0/24`、`239.21.0.0/24`；multiwan 仅在 `cmccitv` 上线时将这四段路由指向其 L3 设备，下线时对这四段设置不可达，避免入组请求误从主表默认 WAN 发出。已有 `rtp2httpd` 的组播上游仍是**电信** `iptv_ipoe`，不会擅自切走现有电信直播；若要让该服务代理移动直播，还须另行配置独立的上游实例及相应的入站防火墙规则，不得把两条 IPTV 上游混为同一接口。
 
 部署时以现网 `/etc/config/network` 为准，绝不上传本地忽略的私有配置；先备份五个运行文件和 NFT 当前规则，再使用服务内置 `check_nft_rules` 做替换事务预检。现网若残留临时规则 `1998: to 183.235.16.92 lookup 500` 和 `1999: from 192.168.3.16 lookup 500`，在新规则生效后**仅核对并删除这两条**，否则它们会覆盖新策略。检查 `ip -4 rule show`、`ip -4 route show table 500`、`ip -4 route get 183.235.162.80 mark 0x00050000` 及四段组播路由，再实际请求频道 API 和回看 HLS；回看链接可访问不等于每一条节目都具有回看权限。
@@ -152,9 +154,39 @@ python3 tools/cmcc-iptv-export.py --host root@192.168.2.1 \
 
 输出 `channels.json`（各频道的华为/中兴组播地址、台标地址、回看地址模板）、直播 `live.m3u`、已结束节目的 `replay.m3u`、XMLTV 格式 `guide.xml` 和下载的 `logos/`。这些数据来自 `183.235.16.92:8082` 的运营商 HTTP 接口，不是网络抓包结果；该地址必须能从路由器经移动 IPTV 线路访问。回看模板使用已验证的中兴 HLS 格式 `183.235.162.80:6610/.../index.m3u8?starttime=...&endtime=...`，但生成的每条链接能否播放仍取决于节目时效、权限和访问回看服务器的路由。机顶盒登录失败不妨碍尝试读取接口，但不能据此判断机顶盒鉴权成功。
 
+#### 移动 IPTV 播放列表（4023，与电信 4022 隔离）
+
+`tools/cmcc-iptv-playlist.py` 是本机 Python 标准库转换工具，从上述导出的 `channels.json` **顶层频道**优先读取 `params.hwurl`，没有有效华为组播地址时才使用 `params.zteurl`；不会误用 `phychannels` 下的另一套地址。实测同一 CCTV-1 频道华为 `239.10.0.202:1025` 收到 UDP，中兴 `239.20.0.192:2182` 未收到；回退到中兴地址仅表示目录中地址格式有效，**不保证可播放**。输出的直播地址为 `http://192.168.2.1:4023/udp/<组播 IPv4>:<UDP 端口>`，`tvg-id` 使用频道 code（与导出的 `guide.xml` 一致），并附 `tvg-name`、公开台标 URL、`group-title` 和可配置的 `x-tvg-url`。不把原始运营商频道资料或机顶盒鉴权 URL 写入 M3U。
+
+```sh
+python3 tools/cmcc-iptv-playlist.py \
+  --channels /tmp/cmcc-iptv-export/channels.json \
+  --out /tmp/cmcc-iptv-export/cmcc.m3u \
+  --guide-url http://192.168.2.1/iptv/cmcc-guide.xml \
+  --logo-base-url http://192.168.2.1/iptv/logos/ \
+  --proxy-base http://192.168.2.1:4023/udp --catchup
+```
+
+本次部署把 `cmcc.m3u`、`cmcc-guide.xml` 和 `logos/` 发布到路由器 `/www/iptv/`，因此列表、节目单和台标地址分别为 `http://192.168.2.1/iptv/cmcc.m3u`、`http://192.168.2.1/iptv/cmcc-guide.xml` 和该目录下的台标。不要发布 `channels.json`、逐节目 `replay.m3u` 或包含运营商原始响应的文件。
+
+确保客户端和路由器都能访问上述 HTTP 文件。`--catchup` 默认关闭；仅在明确需要时加上，此时只对导出器产生且已校验的无凭证中兴 HLS 模板输出 `catchup="default"` 与 `catchup-source`，使用播放器时间占位符 `${(b)yyyyMMddHHmmss}` / `${(e)yyyyMMddHHmmss}`；其他格式、含密钥/账号参数的 URL 一律不复制。回看由播放器直接请求运营商单播地址，**不是** 4023 的组播代理；能否播放取决于播放器格式支持、CMCC 线路路由和运营商权限。
+
+路由器实际启用第二个进程时，**以现网** `/etc/config/rtp2httpd` 为准，先备份、检查是否已有同名段，再只新增以下独立的同类型段：
+
+```uci
+config rtp2httpd 'cmcc'
+	option port '4023'
+	option external_m3u 'http://192.168.2.1/iptv/cmcc.m3u'
+	option advanced_interface_settings '1'
+	option upstream_interface_multicast 'eth2.48'
+```
+
+服务启动脚本按每个 `config rtp2httpd` 段单独启动一个 procd 实例；新段的 `port` 是独立监听端口，`external_m3u` 是路由器可访问的播放列表 HTTP 地址，并非直播流地址。组播上游只能选 CMCC 的 `eth2.48`（或核对后的该线路 L3 设备），不要改动已有电信 4022 段。移动无明确 FCC/RTSP 来源时不填对应选项。路由器上已有四段 CMCC 组播路由；若实际频道端口不是现有服务允许范围，必须另行增加限缩的防火墙规则，不得放宽为所有组播。
+
+
 ### 手动同步 IPTV 服务及防火墙
 
-现网已应用上述配置，**无需再次部署**。日后人工对齐时，先备份路由器现有 `/etc/config/firewall` 与 `/etc/config/rtp2httpd`，直接检查路由器上的配置，不依赖本地忽略的 `etc/config/` 文件。确认只需调整 rtp2httpd 时，核对 `advanced_interface_settings` 和上述三种接口各自的用途，仅修改该服务需要的字段。保持 `/etc/config/network` 的 `iptv` PPPoE、路由表 300、`iptvipoe` 的运营商 DHCP 参数及任何认证密钥不变。
+现网已有的**电信** IPTV 服务与防火墙配置已应用，无需再次部署；上述**移动** 4023 示例尚未在此步骤部署。日后人工对齐电信配置时，先备份路由器现有 `/etc/config/firewall` 与 `/etc/config/rtp2httpd`，直接检查路由器上的配置，不依赖本地忽略的 `etc/config/` 文件。确认只需调整原有 rtp2httpd 段时，核对 `advanced_interface_settings` 和上述三种接口各自的用途，仅修改该服务需要的字段。保持 `/etc/config/network` 的 `iptv` PPPoE、路由表 300、`iptvipoe` 的运营商 DHCP 参数及任何认证密钥不变。
 
 对 `/etc/config/firewall` **只编辑单条规则**：按 `option name 'Allow IPTV multicast'` 找到对应的 `config rule` 段（现网为匿名段），检查来源为 wan zone、IPv4 UDP、目标端口 5146、`direction 'in'`、`device 'iptv_ipoe'`，以及四条 `list dest_ip`：`239.77.0.0/24`、`239.77.1.0/24`、`239.253.43.0/24`、`239.0.10.0/24`。不要用本地文件覆盖整份防火墙配置，也不要假设它始终是 `@rule[11]`。若无同名规则，才在现网配置中添加一条符合上述条件的规则；若发现多条同名规则，先检查并人工合并重复项为一条，不要继续追加。重复同步仍只更新这同一条规则。保持现有 `Allow-IGMP`、其他防火墙规则与 zone 不变；核对保存的文件中恰好一条同名规则且四段目标地址齐全后，在维护窗口重载防火墙与 rtp2httpd（仅当修改对应配置时）。
 

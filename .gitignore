@@ -1,0 +1,5 @@
+# Generated IPTV export data
+/cmcc-iptv-export/
+
+# Python bytecode caches
+__pycache__/

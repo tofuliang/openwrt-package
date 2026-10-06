@@ -175,6 +175,7 @@ show_sets() {
 
     for spec in \
         "iptv|IPTV 目标（走 IPTV 线）" \
+        "cmcc_iptv_services|CMCC IPTV 服务 → IPoE（IP/端口）" \
         "no_balanced|强制走 WAN（动态，10m 超时）" \
         "localnetwork6|本机/内网前缀（不参与策略）" \
         "mobile_destinations|移动目标 → VWAN2" \
@@ -196,7 +197,7 @@ show_sets() {
     [ "$shown" -gt 0 ] || printf "  （未找到集合）\n"
 
     # 小集合列出元素（大集合只给计数，避免刷屏）
-    for name in iptv no_balanced localnetwork6; do
+    for name in iptv cmcc_iptv_services no_balanced localnetwork6; do
         elements=$(set_elements "$name")
         [ -n "$elements" ] || continue
         printf "  %s%s%s 明细：\n" "$C_BOLD" "$name" "$C_RESET"

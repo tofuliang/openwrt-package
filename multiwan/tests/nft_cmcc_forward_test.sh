@@ -56,7 +56,7 @@ table inet cmcc_probe {
     }
     chain observe {
         type filter hook prerouting priority dstnat + 6; policy accept;
-        ip daddr != { 183.235.16.92, 183.235.162.80, 10.10.10.10 } return
+        ip daddr != { 183.235.16.92, 183.235.162.80, 183.235.162.81, 10.10.10.10 } return
         meta mark 0x00050000 counter name cmcc
         meta mark 0x00030000 counter name legacy
         meta mark 0x00010000 counter name forced
@@ -109,6 +109,14 @@ ip -n "$sender" route replace default via 198.51.100.1 dev wgpeer
 expect_packet cmcc "$sender" 183.235.16.92 8081
 expect_packet cmcc "$sender" 183.235.16.92 8082
 expect_packet cmcc "$sender" 183.235.162.80 6610
+
+# A single set owns service tuples: adding a host/port works immediately,
+# while cross-pairing a listed IP with another service's port must not match.
+expect_packet untouched "$sender" 183.235.16.92 6610
+expect_packet untouched "$sender" 183.235.162.80 8082
+ip netns exec "$router" nft add element inet multiwan cmcc_iptv_services '{ 183.235.162.81 . 6610 }'
+expect_packet cmcc "$sender" 183.235.162.81 6610
+ip netns exec "$router" nft delete element inet multiwan cmcc_iptv_services '{ 183.235.162.81 . 6610 }'
 ip -n "$sender" route replace default via 198.51.101.1 dev appeer
 expect_packet cmcc "$sender" 183.235.16.92 8081
 expect_packet cmcc "$sender" 183.235.162.80 6610

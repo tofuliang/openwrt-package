@@ -12,22 +12,32 @@ WAN_TABLE=100
 VWAN_TABLE=200
 IPTV_TABLE=300
 CMCC_TABLE=400
+CMCCITV_TABLE=500
 ROUTE_MARK_MASK=0x000f0000
 WAN_MARK=0x00010000
 VWAN_MARK=0x00020000
 IPTV_MARK=0x00030000
 CMCC_MARK=0x00040000
+CMCCITV_MARK=0x00050000
 STATE_DIR="/var/run/multiwan"
 NFT_RESTART_MARKER="/tmp/${NFT_TABLE}-restart-special.pending"
 RESTART_SPECIAL_DIR="/tmp/${NFT_TABLE}-restart-special"
 SPECIAL_SETS="special_udp_wan_51820 special_udp_vwan_51820 special_udp_wan_51821 special_udp_vwan_51821"
 
 setup_ip_rules() {
+    local rules
     log "Setting up marked policy rules..."
+    # Preserve the terminal guard while replacing table 500's lookup rule:
+    # nft may still be marking traffic during a live service refresh.
+    rules=$(ip -4 rule show) || return 1
+    if ! printf '%s\n' "$rules" | grep -Eq '^2006:[[:space:]].*fwmark 0x0*50000/0x0*f0000[[:space:]].*unreachable([[:space:]]|$)'; then
+        ip rule add priority 2006 from all fwmark $CMCCITV_MARK/$ROUTE_MARK_MASK unreachable || return 1
+    fi
     ip rule del priority 2001 2>/dev/null
     ip rule del priority 2002 2>/dev/null
     ip rule del priority 2003 2>/dev/null
     ip rule del priority 2004 2>/dev/null
+    ip rule del priority 2005 2>/dev/null
     ip -6 rule del priority 2001 2>/dev/null
     ip -6 rule del priority 2002 2>/dev/null
     ip -6 rule del priority 2003 2>/dev/null
@@ -36,10 +46,13 @@ setup_ip_rules() {
     ip rule add priority 2002 from all fwmark $VWAN_MARK/$ROUTE_MARK_MASK lookup $VWAN_TABLE
     ip rule add priority 2003 from all fwmark $IPTV_MARK/$ROUTE_MARK_MASK lookup $IPTV_TABLE
     ip rule add priority 2004 from all fwmark $CMCC_MARK/$ROUTE_MARK_MASK lookup $CMCC_TABLE
+    ip rule add priority 2005 from all fwmark $CMCCITV_MARK/$ROUTE_MARK_MASK lookup $CMCCITV_TABLE || return 1
     ip -6 rule add priority 2001 from all fwmark $WAN_MARK/$ROUTE_MARK_MASK lookup $WAN_TABLE
     ip -6 rule add priority 2002 from all fwmark $VWAN_MARK/$ROUTE_MARK_MASK lookup $VWAN_TABLE
     ip -6 rule add priority 2003 from all fwmark $IPTV_MARK/$ROUTE_MARK_MASK lookup $IPTV_TABLE
     ip -6 rule add priority 2004 from all fwmark $CMCC_MARK/$ROUTE_MARK_MASK lookup $CMCC_TABLE
+    # The IPv4 fail-closed guard and table lookup are mandatory for startup.
+    return 0
 }
 
 remove_ip_rules() {
@@ -48,6 +61,9 @@ remove_ip_rules() {
     ip rule del priority 2002 2>/dev/null
     ip rule del priority 2003 2>/dev/null
     ip rule del priority 2004 2>/dev/null
+    ip rule del priority 2005 2>/dev/null
+    # Keep the CMCC IPTV terminal guard even after nft teardown. A restarted
+    # service can then refresh the table-500 lookup without any fail-open gap.
     ip -6 rule del priority 2001 2>/dev/null
     ip -6 rule del priority 2002 2>/dev/null
     ip -6 rule del priority 2003 2>/dev/null
@@ -129,6 +145,15 @@ start_service() {
         log "ERROR: NFT rules failed validation for $NFT_FILE"
         return 1
     fi
+    # Install the fail-closed CMCC policy before nft begins marking packets.
+    if ! sync_cmccitv_route; then
+        log "ERROR: Failed to prepare fail-closed CMCC IPTV routes"
+        return 1
+    fi
+    if ! setup_ip_rules; then
+        log "ERROR: Failed to install fail-closed policy rules"
+        return 1
+    fi
     nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     if ! nft -f "$NFT_FILE"; then
         log "ERROR: Failed to load NFT rules from $NFT_FILE"
@@ -144,13 +169,16 @@ start_service() {
 
     /usr/sbin/multiwan-isp-update apply 2>/dev/null || log "WARNING: Operator CIDR cache unavailable; destination sets remain empty"
     restore_force_sets || log "WARNING: Failed to restore some forced egress entries"
-    setup_ip_rules
     log "Setting up initial routes..."
     rm -f "$STATE_DIR"/wan_status "$STATE_DIR"/vwan1_status "$STATE_DIR"/vwan2_status "$STATE_DIR"/iptv_status
     if setup_route wan "$WAN_TABLE"; then echo up > "$STATE_DIR/wan_status"; else echo down > "$STATE_DIR/wan_status"; fi
     if setup_route vwan1 "$VWAN_TABLE"; then echo up > "$STATE_DIR/vwan1_status"; else echo down > "$STATE_DIR/vwan1_status"; fi
     if setup_route vwan2 "$CMCC_TABLE"; then echo up > "$STATE_DIR/vwan2_status"; else echo down > "$STATE_DIR/vwan2_status"; fi
     if setup_route iptv "$IPTV_TABLE"; then echo up > "$STATE_DIR/iptv_status"; else echo down > "$STATE_DIR/iptv_status"; fi
+    if ! sync_cmccitv_route; then
+        log "ERROR: Failed to refresh fail-closed CMCC IPTV routes"
+        return 1
+    fi
     rm -f "$STATE_DIR/routing_state"
     if ! update_global_routing startup; then
         log "ERROR: Failed to apply initial routing policy"
@@ -179,8 +207,14 @@ stop_service() {
             rm -rf "$special_dir"
         fi
     fi
-    remove_ip_rules
+    # Prevent a delayed ifup worker from restoring routes after stop.
+    rm -rf "$STATE_DIR"
     nft delete table inet "$NFT_TABLE" 2>/dev/null
+    remove_ip_rules
+    if ! clear_cmccitv_routes; then
+        log "ERROR: Failed to block CMCC IPTV multicast and table 500 routes"
+        return 1
+    fi
     ip route flush table "$WAN_TABLE" 2>/dev/null
     ip route flush table "$VWAN_TABLE" 2>/dev/null
     ip route flush table "$IPTV_TABLE" 2>/dev/null
@@ -189,7 +223,6 @@ stop_service() {
     ip -6 route flush table "$VWAN_TABLE" 2>/dev/null
     ip -6 route flush table "$IPTV_TABLE" 2>/dev/null
     ip -6 route flush table "$CMCC_TABLE" 2>/dev/null
-    rm -rf "$STATE_DIR"
     log "Multi-WAN service stopped."
 }
 

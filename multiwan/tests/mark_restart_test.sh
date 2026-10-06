@@ -34,6 +34,8 @@ NFT_RESTART_MARKER="$tmpdir/restart-special.pending"
 RESTART_SPECIAL_DIR="$tmpdir/restart-special"
 mkdir -p "$STATE_DIR" "$MULTIWAN_LOCK_DIR"
 printf '%s\n' 'table inet multiwan {}' > "$NFT_FILE"
+: > "$tmpdir/no-rules"
+IP_RULES_FILE="$tmpdir/no-rules"
 
 log() { :; }
 setup_route() { :; }
@@ -46,13 +48,20 @@ config_foreach() { :; }
 # generation must continue to use the high mark bits and mask.
 ip() {
     printf '%s\n' "$*" >> "$IP_CALLS"
+    if [ "$*" = '-4 rule show' ]; then
+        cat "${IP_RULES_FILE:-/dev/null}"
+    fi
 }
 expected_rules="$tmpdir/expected.rules"
+# The mandatory guard installs before any stale-rule deletion so the marked
+# class never falls open during the replacement.
 cat > "$expected_rules" <<EOF
+rule add priority 2006 from all fwmark 0x00050000/0x000f0000 unreachable
 rule add priority 2001 from all fwmark 0x00010000/0x000f0000 lookup 100
 rule add priority 2002 from all fwmark 0x00020000/0x000f0000 lookup 200
 rule add priority 2003 from all fwmark 0x00030000/0x000f0000 lookup 300
 rule add priority 2004 from all fwmark 0x00040000/0x000f0000 lookup 400
+rule add priority 2005 from all fwmark 0x00050000/0x000f0000 lookup 500
 -6 rule add priority 2001 from all fwmark 0x00010000/0x000f0000 lookup 100
 -6 rule add priority 2002 from all fwmark 0x00020000/0x000f0000 lookup 200
 -6 rule add priority 2003 from all fwmark 0x00030000/0x000f0000 lookup 300
@@ -61,6 +70,24 @@ EOF
 setup_ip_rules
 awk '$0 ~ /(^| )rule add /' "$IP_CALLS" > "$tmpdir/current.rules"
 diff -u "$expected_rules" "$tmpdir/current.rules"
+
+# Replacing the lookup rule on a live service must keep an existing terminal
+# guard instead of opening a fail-open window between delete and re-add.
+printf '%s\n' '2006: from all fwmark 0x50000/0xf0000 unreachable' > "$tmpdir/live.rules"
+IP_RULES_FILE="$tmpdir/live.rules"
+: > "$IP_CALLS"
+setup_ip_rules
+grep -qFx -- '-4 rule show' "$IP_CALLS"
+! grep -qFx 'rule add priority 2006 from all fwmark 0x00050000/0x000f0000 unreachable' "$IP_CALLS"
+grep -qFx 'rule add priority 2005 from all fwmark 0x00050000/0x000f0000 lookup 500' "$IP_CALLS"
+grep -qFx 'rule del priority 2005' "$IP_CALLS"
+# Without the guard, setup must install it before deleting the old lookup.
+IP_RULES_FILE="$tmpdir/no-rules"
+: > "$IP_CALLS"
+setup_ip_rules
+guard_line=$(grep -nFx 'rule add priority 2006 from all fwmark 0x00050000/0x000f0000 unreachable' "$IP_CALLS" | cut -d: -f1)
+del_line=$(grep -nFx 'rule del priority 2005' "$IP_CALLS" | cut -d: -f1)
+[ -n "$guard_line" ] && [ "$guard_line" -lt "$del_line" ]
 
 cat > "$tmpdir/bin/nft" <<'EOF'
 #!/bin/sh
@@ -86,7 +113,11 @@ cat > "$tmpdir/bin/sysctl" <<'EOF'
 #!/bin/sh
 exit 0
 EOF
-chmod +x "$tmpdir/bin/nft" "$tmpdir/bin/sysctl"
+cat > "$tmpdir/bin/flock" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$tmpdir/bin/nft" "$tmpdir/bin/sysctl" "$tmpdir/bin/flock"
 NFT_SET_DUMP="$tmpdir/nft-set.dump"
 export NFT_FILE STATE_DIR NFT_SET_DUMP
 cat > "$NFT_SET_DUMP" <<'EOF'
@@ -115,9 +146,17 @@ stop_service
 [ -e "$NFT_RESTART_MARKER" ]
 [ -s "$RESTART_SPECIAL_DIR/special_udp_wan_51820.elements" ]
 grep -qF '198.51.100.10 . 51820' "$RESTART_SPECIAL_DIR/special_udp_wan_51820.elements"
+grep -qFx 'route replace unreachable default table 500' "$IP_CALLS"
+grep -qFx 'route replace unreachable 239.20.0.0/24' "$IP_CALLS"
+grep -qFx 'route replace unreachable 239.21.0.0/24' "$IP_CALLS"
+# Teardown must block the lease paths; only deployment may flush table 500.
+! grep -qFx 'route flush table 500' "$IP_CALLS"
 
 export NFT_TABLE_PRESENT=0
 start_service
+grep -qFx 'route replace unreachable default table 500' "$IP_CALLS"
+grep -qFx 'route replace unreachable 239.10.0.0/24' "$IP_CALLS"
+grep -qFx 'route replace unreachable 239.11.0.0/24' "$IP_CALLS"
 grep -qF 'special_udp_wan_51820 198.51.100.10 51820' "$NFT_ACTIVE_ELEMENTS"
 [ ! -e "$NFT_RESTART_MARKER" ]
 [ ! -d "$RESTART_SPECIAL_DIR" ]

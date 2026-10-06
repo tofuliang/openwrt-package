@@ -3,8 +3,7 @@
 # Multi-WAN Management Script
 # status and management CLI
 
-STATE_DIR="/var/run/multiwan"
-NFT_TABLE="multiwan"
+STATE_DIR="${MULTIWAN_STATE_DIR:-/var/run/multiwan}"
 
 # 复用共享库（提供 force_store_* / restore_force_sets 等持久化助手）；
 # 库缺失时降级为"仅操作 nft、不持久化"，不影响其余功能。
@@ -31,6 +30,7 @@ describe_exit() {
         echo "$marks" | grep -q '0x00010000' && exits="$exits WAN"
         echo "$marks" | grep -q '0x00020000' && exits="$exits VWAN1"
         echo "$marks" | grep -q '0x00040000' && exits="$exits VWAN2"
+        echo "$marks" | grep -q '0x00050000' && exits="$exits CMCC IPTV"
         echo "按连接哈希在${exits} 间均衡"
         return
     fi
@@ -40,6 +40,7 @@ describe_exit() {
         *0x00020000*) echo "VWAN1(电信)" ;;
         *0x00030000*) echo "IPTV(电信)" ;;
         *0x00040000*) echo "VWAN2(移动)" ;;
+        *0x00050000*) echo "CMCC IPTV(IPoE)" ;;
         *) echo "$rule" ;;
     esac
 }
@@ -215,7 +216,7 @@ col_line() {
             printf '%s%s%s' "$C_MAGENTA" "$1" "$C_RESET" ;;
         *VWAN1*|*vwan1*|*0x00020000*|*telecom*|*force6_vwan1*|*force_vwan1*)
             printf '%s%s%s' "$C_CYAN" "$1" "$C_RESET" ;;
-        *IPTV*|*iptv*|*0x00030000*)
+        *CMCC*|*cmccitv*|*0x00050000*|*IPTV*|*iptv*|*0x00030000*)
             printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET" ;;
         *WAN*|*wan*|*0x00010000*|*no_balanced*|*force6_wan*|*force_wan*)
             printf '%s%s%s' "$C_BLUE" "$1" "$C_RESET" ;;
@@ -328,7 +329,7 @@ kv_warn() { printf '%s%s%s' "$C_YELLOW" "$1" "$C_RESET"; }
 kv_dim()  { printf '%s%s%s' "$C_DIM" "$1" "$C_RESET"; }
 
 show_status() {
-    local cum_file
+    local cum_file cmcc_status cmcc_up cmcc_dev cmcc_gateway cmcc_address
     sec "多 WAN 状态"
 
     # interface status incl. family
@@ -367,7 +368,19 @@ show_status() {
         [ -n "$v6" ] && printf "  v6: %s%s%s" "$C_CYAN" "$v6" "$C_RESET"
         echo
     done
-
+    # This DHCP lease is independent of the PPPoE IPTV and generic VWAN2 links.
+    cmcc_status=$(ubus call network.interface.cmccitv status 2>/dev/null)
+    cmcc_up=$(printf '%s\n' "$cmcc_status" | jsonfilter -e '@.up' 2>/dev/null)
+    subsec "CMCC IPTV (cmccitv) DHCP 租约"
+    if [ "$cmcc_up" = true ]; then
+        cmcc_dev=$(printf '%s\n' "$cmcc_status" | jsonfilter -e '@.l3_device' 2>/dev/null)
+        cmcc_gateway=$(printf '%s\n' "$cmcc_status" | jsonfilter -e '@.inactive.route[@.target="0.0.0.0"&&@.mask=0].nexthop' 2>/dev/null)
+        cmcc_address=""
+        [ -z "$cmcc_dev" ] || cmcc_address=$(ip -4 -o addr show dev "$cmcc_dev" 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
+        printf '  租约: %s  设备: %s  v4: %s  网关: %s\n' "$(kv_up up)" "${cmcc_dev:--}" "${cmcc_address:--}" "${cmcc_gateway:--}"
+    else
+        printf '  租约: %s  v4: -  网关: -\n' "$(kv_down down)"
+    fi
     echo
 
     # routing state
@@ -403,7 +416,7 @@ show_status() {
 
     # policy routing rules
     subsec "策略路由规则 (v4)"
-    ip rule show 2>/dev/null | grep -E "lookup (100|200|300|400)" | while read -r rule; do
+    ip rule show 2>/dev/null | grep -E 'lookup (100|200|300|400|500)([[:space:]]|$)|^2006:.*unreachable' | while read -r rule; do
         printf '  %s\n' "$(col_line "$rule")"
     done
     subsec "策略路由规则 (v6)"
@@ -412,22 +425,24 @@ show_status() {
     done
     echo
 
-    # routing tables
-    for table in 100 200 300 400; do
+    for table in 100 200 300 400 500; do
         table_name=""
         case $table in
             100) table_name="WAN(电信)" ;;
             200) table_name="VWAN1(电信)" ;;
             300) table_name="IPTV(电信)" ;;
             400) table_name="VWAN2(移动)" ;;
+            500) table_name="CMCC IPTV(IPoE)" ;;
         esac
         printf '  路由表 %s%d%s (%s)\n' "$C_BOLD" "$table" "$C_RESET" "$(col_line "$table_name")"
         ip route show table $table 2>/dev/null | while read -r route; do
             echo "  $route"
         done
-        ip -6 route show table $table 2>/dev/null | grep -v 'Dump terminated' | while read -r route; do
-            [ -n "$route" ] && printf '  %s  %s[IPv6]%s\n' "$route" "$C_DIM" "$C_RESET"
-        done
+        if [ "$table" != 500 ]; then
+            ip -6 route show table "$table" 2>/dev/null | grep -v 'Dump terminated' | while read -r route; do
+                [ -n "$route" ] && printf '  %s  %s[IPv6]%s\n' "$route" "$C_DIM" "$C_RESET"
+            done
+        fi
         echo
     done
 
@@ -524,6 +539,8 @@ show_connections() {
                 iptv_count++
             } else if (route_id == 4) {
                 cmcc_count++
+            } else if (route_id == 5) {
+                cmccitv_count++
             } else {
                 other_count++
                 other_marks[mark_value]++
@@ -537,6 +554,7 @@ show_connections() {
         if (vwan_count > 0) printf "  %s%-15s%s: %d 条连接\n", BL, "VWAN1 (0x00020000)", X, vwan_count
         if (iptv_count > 0) printf "  %s%-15s%s: %d 条连接\n", YL, "IPTV (0x00030000)", X, iptv_count
         if (cmcc_count > 0) printf "  %s%-15s%s: %d 条连接\n", MG, "VWAN2 (0x00040000)", X, cmcc_count
+        if (cmccitv_count > 0) printf "  %s%-15s%s: %d 条连接\n", YL, "CMCC IPTV (0x00050000)", X, cmccitv_count
         if (other_count > 0) {
             for (mark in other_marks) {
                 if (mark == 0) {
@@ -601,13 +619,14 @@ clash_node_lines() {
           if (route_id == 2) return "VWAN1 (0x00020000)"
           if (route_id == 3) return "IPTV  (0x00030000)"
           if (route_id == 4) return "VWAN2 (0x00040000)"
+          if (route_id == 5) return "CMCC IPTV (0x00050000)"
           return "无连接/未标记"
       }
       NR == FNR {
           m = $2 + 0
           # 线路位在 bit16-19，低16位及高位可由 OAF 使用。
           route_id = int(m / 65536) % 16
-          if (route_id < 1 || route_id > 4) next
+          if (route_id < 1 || route_id > 5) next
           cnt[$1 "|" m]++; total[$1]++
           next
       }
@@ -674,7 +693,7 @@ show_clash() {
     clash_node_lines "$ctf"
     echo
     echo "说明：Clash 出线由隧道目标（节点端点）决定，故按端点判定出口；"
-    echo "      0x00010000=WAN 0x00020000=VWAN1 0x00040000=VWAN2 0x00030000=IPTV；标记与端点路由一致才表示真正走该线。"
+    echo "      0x00010000=WAN 0x00020000=VWAN1 0x00040000=VWAN2 0x00030000=IPTV(电信) 0x00050000=CMCC IPTV；标记与端点路由一致才表示真正走该线。"
     rm -f "$ctf"
     sec_end
 }
@@ -759,7 +778,7 @@ show_balance_stats() {
     local interval=${1:-5}
 
     case "$interval" in
-        ''|*[!0-9]*) interval=5 ;;
+        ''|*[!0-9]*|0) interval=5 ;;
     esac
 
     sec "负载均衡统计"
@@ -771,6 +790,7 @@ show_balance_stats() {
         -v v1="$(mark_totals 0x00020000)" \
         -v v2="$(mark_totals 0x00040000)" \
         -v tv="$(mark_totals 0x00030000)" \
+        -v cm="$(mark_totals 0x00050000)" \
         -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" \
         -v G="$C_GREEN" -v Y="$C_YELLOW" -v R="$C_RED" -v B="$C_BOLD" -v D="$C_DIM" -v X="$C_RESET" '
         function pad(n, w,   i, v, c, cols, out) {
@@ -814,21 +834,22 @@ show_balance_stats() {
             print ""
         }
         BEGIN {
-            split(w, W); split(v1, V1); split(v2, V2); split(tv, T)
+            split(w, W); split(v1, V1); split(v2, V2); split(tv, T); split(cm, CM)
             balanced = W[2] + V1[2] + V2[2]
             row("WAN", w, balanced, 1)
             row("VWAN1", v1, balanced, 1)
             row("VWAN2", v2, balanced, 1)
             row("TOTAL", (W[1] + V1[1] + V2[1]) " " balanced, balanced, 1)
             row("IPTV", tv, balanced, 0)
+            row("CMCC", cm, balanced, 0)
         }'
     printf '  %s提示：累计值含历史且只计建连/未跟踪流量；判断实际占用请看“各出口实际速率”。%s\n' "$C_DIM" "$C_RESET"
     echo
 
     # 窗口增量：累计计数器无法就地清零时，用两次采样求差反映当前实际分配
-    local wan0 vwan10 vwan20 iptv0 wan1 vwan11 vwan21 iptv1
+    local wan0 vwan10 vwan20 iptv0 cmcc0 wan1 vwan11 vwan21 iptv1 cmcc1
     local dev_before pol_before dev_after pol_after
-    dev_snapshot() { grep -E 'pppoe-(wan|vwan1|vwan2|iptv):' /proc/net/dev 2>/dev/null | awk '{print $1, $2, $10}'; }
+    dev_snapshot() { grep -E 'pppoe-(wan|vwan1|vwan2|iptv):|eth2\.48:' /proc/net/dev 2>/dev/null | awk '{print $1, $2, $10}'; }
     dev_before=$(mktemp "${TMPDIR:-/tmp}/multiwan-dev-b.XXXXXX")
     pol_before=$(mktemp "${TMPDIR:-/tmp}/multiwan-pol-b.XXXXXX")
     dev_after=$(mktemp "${TMPDIR:-/tmp}/multiwan-dev-a.XXXXXX")
@@ -839,6 +860,7 @@ show_balance_stats() {
     vwan10=$(mark_totals 0x00020000 | awk '{print $2}')
     vwan20=$(mark_totals 0x00040000 | awk '{print $2}')
     iptv0=$(mark_totals 0x00030000 | awk '{print $2}')
+    cmcc0=$(mark_totals 0x00050000 | awk '{print $2}')
 
     echo "采样 ${interval} 秒..."
     sleep "$interval"
@@ -849,10 +871,11 @@ show_balance_stats() {
     vwan11=$(mark_totals 0x00020000 | awk '{print $2}')
     vwan21=$(mark_totals 0x00040000 | awk '{print $2}')
     iptv1=$(mark_totals 0x00030000 | awk '{print $2}')
+    cmcc1=$(mark_totals 0x00050000 | awk '{print $2}')
 
     awk -v i="$interval" \
         -v w="$((wan1 - wan0))" -v v1="$((vwan11 - vwan10))" \
-        -v v2="$((vwan21 - vwan20))" -v tv="$((iptv1 - iptv0))" \
+        -v v2="$((vwan21 - vwan20))" -v tv="$((iptv1 - iptv0))" -v cm="$((cmcc1 - cmcc0))" \
         -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" \
         -v G="$C_GREEN" -v Y="$C_YELLOW" -v R="$C_RED" -v B="$C_BOLD" -v X="$C_RESET" '
         function pc(p,   c) { c = (p >= 35 ? G : (p >= 10 ? Y : R)); return c sprintf("%.0f%%", p) X }
@@ -869,6 +892,7 @@ show_balance_stats() {
             if (total > 0) printf "  (%s)", pc(v2 * 100 / total)
             print ""
             printf "  %s%-8s%s %12.1f KB  %8.1f KB/s\n", YL, "IPTV", X, tv / 1024, tv / 1024 / i
+            printf "  %s%-8s%s %12.1f KB  %8.1f KB/s\n", YL, "CMCC", X, cm / 1024, cm / 1024 / i
             if (total == 0) print "  （该窗口内没有被标记的新流量）"
         }'
     echo
@@ -877,7 +901,7 @@ show_balance_stats() {
     echo "各出口实际速率（近 ${interval} 秒，以接口字节为准）："
     awk -v i="$interval" -v BL="$C_BLUE" -v CY="$C_CYAN" -v MG="$C_MAGENTA" -v YL="$C_YELLOW" -v B="$C_BOLD" -v X="$C_RESET" '
         NR == FNR { rx[$1] = $2; tx[$1] = $3; next }
-        function col(d,   c) { if (index(d, "vwan2")) c = MG; else if (index(d, "vwan1")) c = CY; else if (index(d, "iptv")) c = YL; else c = BL; return c }
+        function col(d,   c) { if (index(d, "vwan2")) c = MG; else if (index(d, "vwan1")) c = CY; else if (index(d, "iptv") || index(d, "eth2.48")) c = YL; else c = BL; return c }
         { drx = $2 - rx[$1]; dtx = $3 - tx[$1]
           printf "  %s%-14s%s RX %9.1f KB/s   TX %9.1f KB/s\n", col($1), $1, X, drx / 1024 / i, dtx / 1024 / i
           trx += drx; ttx += dtx }

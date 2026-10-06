@@ -229,8 +229,9 @@ table inet multiwan {
         iifname "pppoe-wan" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00010000 return
         iifname "pppoe-vwan1" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00020000 return
         iifname "pppoe-vwan2" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00040000 return
-        iifname "pppoe-iptv" ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00030000 return
-        iifname { "pppoe-wan", "pppoe-iptv", "pppoe-vwan1", "pppoe-vwan2" } ct state established,related return
+        iifname { "eth1.45", "pppoe-iptv" } ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00030000 return
+        iifname "eth2.48" ip daddr != 224.0.0.0/4 ct state new ct mark set (ct mark and 0xfff0ffff) or 0x00050000 return
+        iifname { "pppoe-wan", "eth1.45", "pppoe-iptv", "eth2.48", "pppoe-vwan1", "pppoe-vwan2" } ct state established,related return
 
         ip6 daddr @force6_wan counter meta mark set 0x00010000 goto save_mark
         ip6 daddr @force6_vwan1 counter meta mark set 0x00020000 goto save_mark
@@ -242,17 +243,31 @@ table inet multiwan {
         # 目标是路由器本身
         fib daddr type local counter return
 
-        # IPTV 目的地优先于接口跳过规则，保证 WG0/apifox 转发流量同样从 IPTV 口出去
-        iifname { "lo", "apifox", "WG0" } ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
+        # VPN/loopback traffic previously bypassed this check. Keep that exception
+        # while checking ordinary forwarded packets before any destination policy.
+        meta mark != 0 ip saddr @localnetwork ip daddr != @localnetwork iifname != { "lo", "apifox", "WG0" } counter drop
 
-        # 本地环回接口
+        # Explicit egress wins over CMCC IPTV and the legacy @iptv policy,
+        # including for forwarded WG0/apifox/lo traffic. Local destinations
+        # retain their previous exclusion from forced routing.
+        ip daddr != @localnetwork ip daddr @force_wan counter meta mark set 0x00010000 goto save_mark
+        ip daddr != @localnetwork ip daddr @force_vwan1 counter meta mark set 0x00020000 goto save_mark
+        ip daddr != @localnetwork ip daddr @force_vwan2 counter meta mark set 0x00040000 goto save_mark
+
+        # DHCP/IPoE IPTV services, not the general China Mobile PPPoE line.
+        # The legacy Telecom TVBOX source keeps its existing IPTV policy.
+        # Classify before tunnel-interface bypass and ct mark restore so
+        # forwarded and established CMCC sessions stay on IPoE.
+        ip saddr != 192.168.1.153 ip daddr 183.235.16.92 tcp dport { 8081, 8082 } counter meta mark set 0x00050000 goto save_mark
+        ip saddr != 192.168.1.153 ip daddr 183.235.162.80 tcp dport 6610 counter meta mark set 0x00050000 goto save_mark
+
+        # Legacy IPTV destinations also cover VPN/loopback forwarded traffic.
+        iifname { "lo", "apifox", "WG0" } ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
         iifname { "lo", "apifox", "WG0" } counter return
 
         # 目标是内网地址
         ip daddr @localnetwork counter return
 
-        # 安全检测
-        meta mark != 0 ip saddr @localnetwork iifname != "lo" counter drop
         # 已有连接标记的流量
         ct state established,related meta mark set ct mark return
 
@@ -266,10 +281,6 @@ table inet multiwan {
         # IPTV集合中的IP走IPTV
         ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
 
-        # 不参与负载均衡的目标走固定线路。
-        ip daddr @force_wan counter meta mark set 0x00010000 goto save_mark
-        ip daddr @force_vwan1 counter meta mark set 0x00020000 goto save_mark
-        ip daddr @force_vwan2 counter meta mark set 0x00040000 goto save_mark
         ip daddr @no_balanced counter meta mark set 0x00010000 goto save_mark
         # 不参与负载均衡的来源走 WAN。
         ip saddr @no_balanced_src counter meta mark set 0x00010000 goto save_mark
@@ -289,6 +300,10 @@ table inet multiwan {
         ip daddr @force_wan counter meta mark set 0x00010000 goto save_mark
         ip daddr @force_vwan1 counter meta mark set 0x00020000 goto save_mark
         ip daddr @force_vwan2 counter meta mark set 0x00040000 goto save_mark
+        # Catalog/EPG/logos and replay use the CMCC IPTV DHCP gateway.
+        ip daddr 183.235.16.92 tcp dport { 8081, 8082 } counter meta mark set 0x00050000 goto save_mark
+        ip daddr 183.235.162.80 tcp dport 6610 counter meta mark set 0x00050000 goto save_mark
+
 
         # IPTV 目的地走 IPTV 口：路由器自身流量此前无任何打标规则，会落到 main 表默认出口
         ip daddr @iptv counter meta mark set 0x00030000 goto save_mark
@@ -337,13 +352,15 @@ table inet multiwan {
         meta mark 0x00020000 counter comment "VWAN1流量计数"
         meta mark 0x00030000 counter comment "IPTV流量计数"
         meta mark 0x00040000 counter comment "VWAN2(移动)流量计数"
+        meta mark 0x00050000 counter comment "CMCC IPTV(IPoE)流量计数"
 
-        meta mark != 0x00010000 meta mark != 0x00020000 meta mark != 0x00030000 meta mark != 0x00040000 limit rate 1/minute log prefix "Unknown mark: "
+        meta mark != 0x00010000 meta mark != 0x00020000 meta mark != 0x00030000 meta mark != 0x00040000 meta mark != 0x00050000 limit rate 1/minute log prefix "Unknown mark: "
         counter comment "总流量计数"
         meta mark 0x00010000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00010000 comment "保存WAN线路位"
         meta mark 0x00020000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00020000 comment "保存VWAN1线路位"
         meta mark 0x00030000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00030000 comment "保存IPTV线路位"
         meta mark 0x00040000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00040000 comment "保存VWAN2线路位"
+        meta mark 0x00050000 counter ct mark set (ct mark and 0xfff0ffff) or 0x00050000 comment "保存CMCC IPTV线路位"
     }
 }
 

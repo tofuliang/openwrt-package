@@ -8,6 +8,8 @@ NFT_TABLE="multiwan"
 ROUTE_MARK_WAN=0x00010000
 ROUTE_MARK_VWAN1=0x00020000
 ROUTE_MARK_VWAN2=0x00040000
+# Unlike generic vwan2, this DHCP IPTV line has its gateway in inactive.route.
+CMCCITV_MCAST_NETS="239.10.0.0/24 239.11.0.0/24 239.20.0.0/24 239.21.0.0/24"
 # 日志函数
 log() {
     local tag="$1"
@@ -525,6 +527,60 @@ setup_route() {
     flock -u 9
     return 0
 }
+
+# Keep table 500 and IGMP membership routes in sync with the *current* netifd state.
+# Both ifup and ifdown re-read ubus under the same lock: a delayed event cannot
+# remove a newer lease's route or resurrect a disconnected interface.
+cmccitv_route_lock() {
+    local dir="${MULTIWAN_LOCK_DIR:-/var/lock}"
+    mkdir -p "$dir" || return 1
+    exec 9>"$dir/multiwan_route_500" || return 1
+    flock 9
+}
+
+cmccitv_unreachable() {
+    local net failed=0
+    ip route replace unreachable default table 500 || failed=1
+    for net in $CMCCITV_MCAST_NETS; do
+        # Without these scoped rejects, IGMP joins would fall back to main's WAN.
+        ip route replace unreachable "$net" || failed=1
+    done
+    return "$failed"
+}
+
+sync_cmccitv_route() (
+    local status="" up="" device="" gateway="" net failed=0
+    cmccitv_route_lock || return 1
+    [ -d "$STATE_DIR" ] || return 0
+    status=$(ubus call network.interface.cmccitv status 2>/dev/null) || status=""
+    if [ -n "$status" ]; then
+        up=$(printf '%s\n' "$status" | jsonfilter -e '@.up') || up=""
+        if [ "$up" = true ]; then
+            device=$(printf '%s\n' "$status" | jsonfilter -e '@.l3_device') || device=""
+            # DHCP's default is inactive in netifd because defaultroute is disabled.
+            gateway=$(printf '%s\n' "$status" | jsonfilter -e '@.inactive.route[@.target="0.0.0.0"&&@.mask=0].nexthop') || gateway=""
+        fi
+    fi
+
+    if [ "$up" = true ] && [ -n "$device" ] && [ -n "$gateway" ] && ip link show "$device" >/dev/null 2>&1; then
+        for net in $CMCCITV_MCAST_NETS; do
+            ip route replace "$net" dev "$device" || failed=1
+        done
+        if [ "$failed" -eq 0 ] && ip route replace default via "$gateway" dev "$device" table 500; then
+            return 0
+        fi
+    fi
+    # Never use generic setup_route's default-dev fallback: Ethernet would ARP
+    # for each IPTV server instead of the DHCP gateway.
+    [ "$up" != true ] || log "multiwan-route" "CMCC IPTV gateway unavailable on $device; blocking table 500"
+    cmccitv_unreachable
+)
+
+clear_cmccitv_routes() (
+    cmccitv_route_lock || return 1
+    # Stop/restart must not expose the IPTV multicast groups via the main WAN.
+    cmccitv_unreachable
+)
 
 # 检查接口健康状况的通用函数（从mwan3借鉴）
 check_interface_health() {

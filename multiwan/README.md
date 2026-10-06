@@ -133,6 +133,25 @@ ip -4 route show 239.77.0.0/24    # dev iptv_ipoe
 
 现网 `Allow-IGMP` 放行 IGMP；`/etc/config/firewall` 中的 `Allow IPTV multicast` 仅允许来自 wan zone、进入 `iptv_ipoe` 的 IPv4 UDP 5146 发往上述四段组播地址。仅放行单个组播地址的 UDP 5146 时，其他频道虽能在 `iptv_ipoe` 抓到 UDP 包，rtp2httpd 仍会返回 HTTP 503；放行相应组播目标后可收到直播数据。不要全量放开 WAN 组播，也不要删除 PPPoE 单播所需的规则。
 
+### 移动 IPTV 的独立出口
+
+移动 IPTV 的 `cmccitv` 是 `eth2.48` 上的 DHCP/IPoE 接口，**不同于**通用移动宽带 `vwan2`（表 400）和电信 IPTV `iptv`（表 300）。multiwan 为它单独维护 IPv4 表 500、标记 `0x00050000` 与优先级 2005 的规则；路由器自身及 LAN 客户端访问频道/节目单/台标 `183.235.16.92:8081,8082`、中兴回看 `183.235.162.80:6610` 时走 `cmccitv`，显式 `force-*` 规则仍优先。DHCP 默认路由被网络配置禁用时，从 netifd 报告的 inactive 默认路由读取网关；接口或网关不可用时对这些目的地拒绝转发，不回退到普通移动宽带或电信出口。
+
+运营商频道列表中的移动直播组播落在 `239.10.0.0/24`、`239.11.0.0/24`、`239.20.0.0/24`、`239.21.0.0/24`；multiwan 仅在 `cmccitv` 上线时将这四段路由指向其 L3 设备，下线时对这四段设置不可达，避免入组请求误从主表默认 WAN 发出。已有 `rtp2httpd` 的组播上游仍是**电信** `iptv_ipoe`，不会擅自切走现有电信直播；若要让该服务代理移动直播，还须另行配置独立的上游实例及相应的入站防火墙规则，不得把两条 IPTV 上游混为同一接口。
+
+部署时以现网 `/etc/config/network` 为准，绝不上传本地忽略的私有配置；先备份五个运行文件和 NFT 当前规则，再使用服务内置 `check_nft_rules` 做替换事务预检。现网若残留临时规则 `1998: to 183.235.16.92 lookup 500` 和 `1999: from 192.168.3.16 lookup 500`，在新规则生效后**仅核对并删除这两条**，否则它们会覆盖新策略。检查 `ip -4 rule show`、`ip -4 route show table 500`、`ip -4 route get 183.235.162.80 mark 0x00050000` 及四段组播路由，再实际请求频道 API 和回看 HLS；回看链接可访问不等于每一条节目都具有回看权限。
+
+### 移动 IPTV 应用层频道资料导出
+
+`tools/cmcc-iptv-export.py` 在**本机 Python 3** 上运行，通过 SSH 调用 OpenWrt 上的 `curl`，请求运营商的 HTTP 频道/节目单/台标接口；**不使用 tcpdump，也不需要机顶盒开机**。脚本只读取数据，不改动路由、接口或防火墙。
+
+```sh
+python3 tools/cmcc-iptv-export.py --host root@192.168.2.1 \
+  --date 20261005 --out /tmp/cmcc-iptv-export
+```
+
+输出 `channels.json`（各频道的华为/中兴组播地址、台标地址、回看地址模板）、直播 `live.m3u`、已结束节目的 `replay.m3u`、XMLTV 格式 `guide.xml` 和下载的 `logos/`。这些数据来自 `183.235.16.92:8082` 的运营商 HTTP 接口，不是网络抓包结果；该地址必须能从路由器经移动 IPTV 线路访问。回看模板使用已验证的中兴 HLS 格式 `183.235.162.80:6610/.../index.m3u8?starttime=...&endtime=...`，但生成的每条链接能否播放仍取决于节目时效、权限和访问回看服务器的路由。机顶盒登录失败不妨碍尝试读取接口，但不能据此判断机顶盒鉴权成功。
+
 ### 手动同步 IPTV 服务及防火墙
 
 现网已应用上述配置，**无需再次部署**。日后人工对齐时，先备份路由器现有 `/etc/config/firewall` 与 `/etc/config/rtp2httpd`，直接检查路由器上的配置，不依赖本地忽略的 `etc/config/` 文件。确认只需调整 rtp2httpd 时，核对 `advanced_interface_settings` 和上述三种接口各自的用途，仅修改该服务需要的字段。保持 `/etc/config/network` 的 `iptv` PPPoE、路由表 300、`iptvipoe` 的运营商 DHCP 参数及任何认证密钥不变。

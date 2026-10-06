@@ -54,6 +54,16 @@ case "$INTERFACE" in
         fi
         ;;
 
+    cmccitv)
+        # The current ubus lease (not the event's age) decides whether to
+        # install a gateway or unreachable routes; both paths share a lock.
+        if [ "$ACTION" = "ifup" ]; then
+            (sleep 2; [ ! -d "$STATE_DIR" ] || sync_cmccitv_route) &
+        elif [ "$ACTION" = "ifdown" ] || [ "$ACTION" = "ifupdate" ]; then
+            [ ! -d "$STATE_DIR" ] || sync_cmccitv_route
+        fi
+        ;;
+
     wan_6|vwan1_6|vwan2_6)
         # IPv6地址/前缀变化时重选本机无源IPv6默认路由。
         ensure_ipv6_host_default || log "multiwan-ipv6" "Warning: failed to refresh host IPv6 default route after $INTERFACE $ACTION"

@@ -1,0 +1,60 @@
+#!/bin/sh
+# This daemon only rolls calendar rules and fetches annual data. It must never
+# restart the service, which would terminate the procd instance running it.
+
+. "${ACCESSCONTROL_FUNCTIONS_LIB:-/lib/functions.sh}"
+. "${ACCESSCONTROL_INIT_SCRIPT:-/etc/init.d/accesscontrol}"
+
+token="$1"
+ACCESSCONTROL_FETCH_PID=
+ACCESSCONTROL_FETCH_DIR=
+ACCESSCONTROL_RULES_DIR=
+sleep_pid=
+
+watcher_exit() {
+	# timeout forwards TERM to the fetch process and reaps it before returning.
+	# Ignore a duplicate stop signal until both managed children are reaped.
+	trap '' TERM INT
+	[ -z "$ACCESSCONTROL_FETCH_PID" ] || kill "$ACCESSCONTROL_FETCH_PID" 2>/dev/null
+	[ -z "$ACCESSCONTROL_FETCH_PID" ] || wait "$ACCESSCONTROL_FETCH_PID" 2>/dev/null
+	[ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null
+	[ -z "$sleep_pid" ] || wait "$sleep_pid" 2>/dev/null
+	[ -z "$ACCESSCONTROL_FETCH_DIR" ] || rm -rf "$ACCESSCONTROL_FETCH_DIR"
+	[ -z "$ACCESSCONTROL_RULES_DIR" ] || rm -rf "$ACCESSCONTROL_RULES_DIR"
+	exit 0
+}
+
+trap watcher_exit TERM INT
+last_key=
+while calendar_active "$token"; do
+	refresh_ok=1
+	key=$(calendar_clock_key)
+	if [ "$key" != "$last_key" ]; then
+		if calendar_refresh "$token"; then
+			last_key="$key"
+		else
+			# Retry only local caches while an apply is pending. Download
+			# scheduling resumes after a successful ready/fallback transaction.
+			last_key=
+			refresh_ok=0
+		fi
+	fi
+	calendar_active "$token" || break
+	today=$(date +%Y-%m-%d)
+	if [ "$refresh_ok" = 1 ] && calendar_fetch_due "$token" "$today"; then
+		# Switch from selected weekdays to the calendar immediately after a
+		# validated download, without any service restart or midnight gap.
+		key=$(calendar_clock_key)
+		if calendar_refresh "$token"; then
+			last_key="$key"
+		else
+			last_key=
+		fi
+	fi
+	calendar_active "$token" || break
+	sleep 60 &
+	sleep_pid=$!
+	wait "$sleep_pid"
+	sleep_pid=
+done
+watcher_exit

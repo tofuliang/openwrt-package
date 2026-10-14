@@ -1,104 +1,181 @@
 msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8"
 
-
-# Used in: overview.js:49
-msgid "Internet Access Schedule Control"
-msgstr ""
-
-# Used in: overview.js:50
-msgid "Control internet access for specific devices based on time schedules and MAC addresses."
-msgstr ""
-
-# Used in: overview.js:57
-msgid "Service Status"
-msgstr ""
-
-# Used in: overview.js:58
-msgid "Checking..."
-msgstr ""
-
-# Used in: overview.js:32
-msgid "Running (IPv4 + IPv6)"
-msgstr ""
-
-# Used in: overview.js:34
-msgid "Running (IPv4 only)"
-msgstr ""
-
-# Used in: overview.js:36
-msgid "Running (IPv6 only)"
-msgstr ""
-
-# Used in: overview.js:38
-msgid "Not running"
-msgstr ""
-
-# Used in: overview.js:61
-msgid "Global Settings"
-msgstr ""
-
-# Used in: overview.js:65, overview.js:80
-msgid "Enable"
-msgstr ""
-
-# Used in: overview.js:69
-msgid "Strict Mode"
-msgstr ""
-
-# Used in: overview.js:72
-msgid "Strict mode provides better blocking but may impact CPU performance"
-msgstr ""
-
-# Used in: overview.js:75
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:383
 msgid "Access Control Rules"
 msgstr ""
 
-# Used in: overview.js:85
-msgid "MAC Address"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:251
+msgid ""
+"Rule %d (%s–%s) already covers this whole period, so this rule never adds "
+"blocking. Click here to highlight it."
 msgstr ""
 
-# Used in: overview.js:95
-msgid "Start Time"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:336
+msgid "Chain exists (no rules)"
 msgstr ""
 
-# Used in: overview.js:105
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:358
+msgid "Checking..."
+msgstr ""
+
+#: root/usr/share/luci/menu.d/luci-app-accesscontrol.json:3
+msgid "Control"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:357
+msgid ""
+"Control internet access for specific devices based on time schedules and MAC "
+"addresses."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:145
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:145
+msgid "Enable"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:419
 msgid "End Time"
 msgstr ""
 
-# Used in: overview.js:101, overview.js:111
-msgid "Invalid time format. Use HH:MM (24-hour format)"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:436
+msgid ""
+"For this rule, holiday mode and weekday selection are mutually exclusive. "
+"Chinese working days replace the selected weekdays: ordinary weekends and "
+"holidays are unrestricted; make-up working days are restricted. This rule's "
+"times and MAC address still apply. Weekday edits are saved even when holiday "
+"mode hides them; turning holiday mode off restores these selections."
 msgstr ""
 
-# Used in: overview.js:117
-msgid "Monday"
-msgstr ""
-
-# Used in: overview.js:118
-msgid "Tuesday"
-msgstr ""
-
-# Used in: overview.js:119
-msgid "Wednesday"
-msgstr ""
-
-# Used in: overview.js:120
-msgid "Thursday"
-msgstr ""
-
-# Used in: overview.js:121
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:437
 msgid "Friday"
 msgstr ""
 
-# Used in: overview.js:122
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:371
+msgid "Global Settings"
+msgstr ""
+
+#: root/usr/share/rpcd/acl.d/luci-app-accesscontrol.json:3
+msgid "Grant UCI access for luci-app-accesscontrol"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:84
+msgid "Holiday calendar ready."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:90
+msgid ""
+"Holiday calendar rules could not be applied. Previous rules are retained "
+"while retrying."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:93
+msgid "Holiday calendar status could not be read."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:93
+msgid ""
+"Holiday calendar status could not be read. Refresh the page or log in again."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:81
+msgid ""
+"Holiday calendar status is not available yet. Save & Apply to start the "
+"holiday service; if it stays empty, check the system log."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:87
+msgid ""
+"Holiday calendar unavailable. Using the rules' selected weekdays until "
+"calendar data is ready."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:437
+msgid ""
+"Holiday mode dates each part of a period by the day it belongs to: a part "
+"crossing midnight follows its end date, and a part from 18:00 on follows the "
+"next day, so the night before a holiday stays open and the last holiday "
+"night is restricted. A period that reaches 18:00 is split at that boundary. "
+"For example 20:10–08:00 and 21:30–22:00 are both unrestricted on an ordinary "
+"Friday night and restricted on the last holiday night, while 17:00–18:30 "
+"keeps 17:00–18:00 on the current day and follows the next day from 18:00."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:438
+msgid ""
+"Holiday mode follows the router's own timezone from System → Timezone for "
+"both the period times and the holiday dates, so a China holiday calendar "
+"needs the router set to a UTC+8 zone."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:439
+msgid ""
+"Holiday mode includes the entire end minute: an end time of 06:00 remains "
+"restricted through 06:00:59 and releases at 06:01. Equal start and end times "
+"restrict only that minute."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:440
+msgid ""
+"If calendar data is unavailable, this rule uses its selected weekdays. If "
+"calendar rules cannot be applied, the previous rules remain in place while "
+"the service retries."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:355
+#: root/usr/share/luci/menu.d/luci-app-accesscontrol.json:10
+msgid "Internet Access Schedule Control"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:415
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:415
+msgid "Invalid time format. Use HH:MM (24-hour format)"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:397
+msgid "MAC Address"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:445
+msgid "Monday"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:338
+msgid "Not running"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:28
+msgid "Option \"%s\" contains an invalid input value."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:430
+msgid "Respect holidays"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:334
+msgid "Running (nftables)"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:450
 msgid "Saturday"
 msgstr ""
 
-# Used in: overview.js:123
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:408
+msgid "Start Time"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:451
 msgid "Sunday"
 msgstr ""
 
-# Used in: menu.d/luci-app-accesscontrol.json
-msgid "Control"
-msgstr ""msgid "Service started but no rules active"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:448
+msgid "Thursday"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:446
+msgid "Tuesday"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:447
+msgid "Wednesday"
 msgstr ""

@@ -3,6 +3,7 @@ config global 'global'
 
 config rule
 	option enabled '1'
+	option respect_holidays '0'
 	option macaddr '00:11:22:33:44:55'
 	option start_time '22:00'
 	option end_time '06:00'

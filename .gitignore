@@ -3,3 +3,6 @@
 
 # Python bytecode caches
 __pycache__/
+
+# Generated OpenWrt packages
+/bin/

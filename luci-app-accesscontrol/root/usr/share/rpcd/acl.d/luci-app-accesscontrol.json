@@ -3,9 +3,14 @@
 		"description": "Grant UCI access for luci-app-accesscontrol",
 		"read": {
 			"uci": [ "accesscontrol" ],
+			"ubus": {
+				"file": [ "read" ]
+			},
 			"file": {
 				"nft list table inet fw4": [ "exec" ],
-				"nft list chain inet fw4 accesscontrol": [ "exec" ]
+				"nft list chain inet fw4 accesscontrol": [ "exec" ],
+				"/var/run/accesscontrol-calendar.status": [ "read" ],
+				"/tmp/run/accesscontrol-calendar.status": [ "read" ]
 			}
 		},
 		"write": {

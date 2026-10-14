@@ -12,6 +12,9 @@ USE_PROCD=1
 
 CONFIG=accesscontrol
 
+. "${ACCESSCONTROL_CALENDAR_LIB:-/usr/libexec/accesscontrol-calendar.sh}"
+ACCESSCONTROL_FIREWALL_INCLUDE=${ACCESSCONTROL_FIREWALL_INCLUDE:-/var/etc/accesscontrol.include}
+
 # Debug switch - set to 1 to enable debug output, 0 to disable
 DEBUG=1
 
@@ -129,9 +132,30 @@ add_rules() {
 	config_load "$CONFIG"
 	
 	debug_log "Using config_foreach to process rules"
-	config_foreach process_rule rule
+	config_foreach process_legacy_rule rule
 	
 	debug_log "Finished add_rules function"
+}
+
+# Only holiday-mode rules are placed in the rolling child chain.
+process_legacy_rule() {
+	local respect_holidays
+	config_get respect_holidays "$1" respect_holidays 0
+	[ "$respect_holidays" = 1 ] || process_rule "$1"
+}
+
+# Keep the old weekday commands unchanged; calendar fallback collects the same
+# commands into the child chain's atomic transaction instead of running them.
+accesscontrol_add_rule() {
+	if [ -n "${ACCESSCONTROL_RULE_BATCH:-}" ]; then
+		{
+			printf 'add rule inet fw4 %s ' "$ACCESSCONTROL_RULE_CHAIN"
+			printf '%s ' "$@"
+			printf '\n'
+		} >> "$ACCESSCONTROL_RULE_BATCH" || CALENDAR_BUILD_FAILED=1
+	else
+		TZ=UTC nft add rule inet fw4 accesscontrol "$@"
+	fi
 }
 
 process_rule() {
@@ -223,7 +247,7 @@ process_rule() {
 			local nft_start_weekdays="{ $start_weekdays }"
 			
 			debug_log "Rule 1 (UTC) - Time: $start_utc_time-23:59, Days: $start_weekdays"
-			TZ=UTC nft add rule inet fw4 accesscontrol \
+			accesscontrol_add_rule \
 				ether saddr "$macaddr" \
 				meta hour \"$start_utc_time\"-\"23:59\" meta day $nft_start_weekdays \
 				counter drop \
@@ -238,7 +262,7 @@ process_rule() {
 			local nft_end_weekdays="{ $end_weekdays }"
 			
 			debug_log "Rule 2 (UTC) - Time: 00:00-$end_utc_time, Days: $end_weekdays"
-			TZ=UTC nft add rule inet fw4 accesscontrol \
+			accesscontrol_add_rule \
 				ether saddr "$macaddr" \
 				meta hour \"00:00\"-\"$end_utc_time\" meta day $nft_end_weekdays \
 				counter drop \
@@ -258,7 +282,7 @@ process_rule() {
 			local nft_weekdays="{ $adjusted_weekdays }"
 			
 			debug_log "Normal UTC time range, single rule: $start_utc_time-$end_utc_time, Days: $adjusted_weekdays"
-			TZ=UTC nft add rule inet fw4 accesscontrol \
+			accesscontrol_add_rule \
 				ether saddr "$macaddr" \
 				meta hour \"$start_utc_time\"-\"$end_utc_time\" meta day $nft_weekdays \
 				counter drop \
@@ -277,93 +301,99 @@ validate_section_accesscontrol() {
 }
 
 start_service() {
-	local enabled
-	
+	local enabled CALENDAR_SESSION
+
 	debug_log "Starting accesscontrol service"
-	
 	validate_section_accesscontrol global || {
 		debug_log "Validation failed for global section"
 		echo "validation failed"
 		return 1
 	}
-	
-	debug_log "Global section validation passed - enabled: $enabled"
-	
-	mkdir -p /var/etc
-	cat > "/var/etc/accesscontrol.include" <<-EOF
-/etc/init.d/accesscontrol start
-EOF
 
-	[ "$enabled" = "1" ] || {
+	mkdir -p "${ACCESSCONTROL_FIREWALL_INCLUDE%/*}"
+	cat > "$ACCESSCONTROL_FIREWALL_INCLUDE" <<-EOF
+	/etc/init.d/accesscontrol start
+	EOF
+
+	calendar_lock || return 1
+	calendar_clear_session
+	remove_rules
+	[ "$enabled" = 1 ] || {
+		calendar_unlock
 		debug_log "Service is disabled, exiting"
 		return 0
 	}
-	
-	# Create our independent chains in existing fw4 table
-	debug_log "Creating access control chains in fw4 table"
-	
-	# Ensure fw4 table exists (it should in OpenWrt with firewall4)
 	if ! nft list table inet fw4 >/dev/null 2>&1; then
+		calendar_unlock
 		debug_log "fw4 table not found, this may indicate firewall4 is not running"
 		return 1
 	fi
-	
-	# Check if already running and clean up first
-	debug_log "Checking if service is already running"
-	if nft list chain inet fw4 accesscontrol >/dev/null 2>&1; then
-		debug_log "Service already running, stopping first to avoid duplicate rules"
-		stop_service
+	if ! nft add chain inet fw4 accesscontrol; then
+		calendar_unlock
+		return 1
 	fi
-	
-	# Create our independent access_control chain
-	nft add chain inet fw4 accesscontrol 2>/dev/null
-	
-	# Add forward chain integration - this is all we need for access control
-	debug_log "Adding forward chain integration"
-	if ! nft list chain inet fw4 forward 2>/dev/null | grep -q "AccessControl Forward"; then
-		nft insert rule inet fw4 forward \
-			counter jump accesscontrol \
-			comment \"AccessControl Forward\"
-	else
-		debug_log "Forward chain integration already exists, skipping"
-	fi
-	
-	# Load and apply rules
-	debug_log "Loading and applying access control rules"
+	nft insert rule inet fw4 forward counter jump accesscontrol comment \"AccessControl Forward\"
 	add_rules
-	
-	debug_log "Accesscontrol is a one-shot firewall setup; no resident process required"
-	
+	calendar_count_rules
+	if [ "$CALENDAR_RULE_COUNT" -gt 0 ]; then
+		if ! nft add chain inet fw4 accesscontrol_calendar ||
+		   ! nft add rule inet fw4 accesscontrol jump accesscontrol_calendar comment \"AccessControl Calendar\" ||
+		   ! calendar_new_session; then
+			calendar_clear_session
+			remove_rules
+			calendar_unlock
+			return 1
+		fi
+		# Apply only local caches here. The daemon downloads after firewall start.
+		if ! calendar_refresh_locked "$CALENDAR_SESSION"; then
+			# The helper records apply-error and retains any prior child chain;
+			# startup must not relabel that failure as unavailable.
+			debug_log "Initial holiday calendar apply failed; watcher will retry"
+		fi
+		procd_open_instance calendar
+		procd_set_param command /usr/libexec/accesscontrol-calendar-watch "$CALENDAR_SESSION"
+		procd_set_param respawn 3600 5 5
+		# GNU timeout has a five-second TERM-to-KILL grace period; let the
+		# watcher reap it and remove private work before procd escalates.
+		procd_set_param term_timeout 10
+		procd_close_instance
+	fi
+	calendar_unlock
 	debug_log "Accesscontrol service started successfully"
+}
+
+# The caller holds the calendar lock, so a terminating watcher cannot restore
+# rules between removing the forward jump and deleting the child chain.
+remove_rules() {
+	nft -a list chain inet fw4 forward 2>/dev/null | grep "AccessControl Forward" | while read -r line; do
+		handle=$(echo "$line" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+		[ -z "$handle" ] || nft delete rule inet fw4 forward handle "$handle" 2>/dev/null
+	done
+	if nft list chain inet fw4 accesscontrol >/dev/null 2>&1; then
+		nft flush chain inet fw4 accesscontrol 2>/dev/null
+	fi
+	if nft list chain inet fw4 accesscontrol_calendar >/dev/null 2>&1; then
+		nft flush chain inet fw4 accesscontrol_calendar 2>/dev/null
+		nft delete chain inet fw4 accesscontrol_calendar 2>/dev/null
+	fi
+	nft delete chain inet fw4 accesscontrol 2>/dev/null
+	return 0
 }
 
 stop_service() {
 	debug_log "Stopping accesscontrol service"
-	
-	# Remove AccessControl rules from forward chain
-	debug_log "Removing AccessControl rules from forward chain"
-	nft -a list chain inet fw4 forward 2>/dev/null | grep "AccessControl Forward" | while read -r line; do
-		handle=$(echo "$line" | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
-		if [ -n "$handle" ]; then
-			debug_log "Removing forward chain rule handle $handle"
-			nft delete rule inet fw4 forward handle "$handle" 2>/dev/null
-		fi
-	done
-	
-	# Clean up our independent chain
-	if nft list chain inet fw4 accesscontrol >/dev/null 2>&1; then
-		debug_log "Removing accesscontrol chain"
-		nft flush chain inet fw4 accesscontrol 2>/dev/null
-		nft delete chain inet fw4 accesscontrol 2>/dev/null
-	fi
-	
+	calendar_lock || return 1
+	calendar_clear_session
+	remove_rules
+	calendar_unlock
+	# rc.common stops the procd instance immediately after this returns.
 	debug_log "Accesscontrol service stopped successfully"
 }
 
 reload_service() {
-	debug_log "Reloading accesscontrol service"
-	stop_service
-	start_service
+	# Use rc.common's procd wrapper so disabled or changed rules also replace
+	# the watcher instance. The worker itself never restarts its own service.
+	start
 }
 
 service_triggers() {

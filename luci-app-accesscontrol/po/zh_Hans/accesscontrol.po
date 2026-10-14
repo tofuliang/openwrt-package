@@ -1,102 +1,149 @@
 msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8"
 
-# Used in: overview.js:49
-msgid "Internet Access Schedule Control"
-msgstr "上网时间控制"
-
-# Used in: overview.js:50
-msgid "Control internet access for specific devices based on time schedules and MAC addresses."
-msgstr "基于时间计划和MAC地址控制特定设备的互联网访问"
-
-# Used in: overview.js:57
-msgid "Service Status"
-msgstr "服务状态"
-
-# Used in: overview.js:58
-msgid "Checking..."
-msgstr "检查中..."
-
-# Used in: overview.js:32
-msgid "Running (IPv4 + IPv6)"
-msgstr "运行中 (IPv4 + IPv6)"
-
-# Used in: overview.js:34
-msgid "Running (IPv4 only)"
-msgstr "运行中 (仅IPv4)"
-
-# Used in: overview.js:36
-msgid "Running (IPv6 only)"
-msgstr "运行中 (仅IPv6)"
-
-# Used in: overview.js:38
-msgid "Not running"
-msgstr "未运行"
-
-# Used in: overview.js:61
-msgid "Global Settings"
-msgstr "全局设置"
-
-# Used in: overview.js:65, overview.js:80
-msgid "Enable"
-msgstr "启用"
-
-# Used in: overview.js:69
-msgid "Strict Mode"
-msgstr "严格模式"
-
-# Used in: overview.js:72
-msgid "Strict mode provides better blocking but may impact CPU performance"
-msgstr "严格模式提供更好的阻断效果，但可能影响CPU性能"
-
-# Used in: overview.js:75
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:383
 msgid "Access Control Rules"
 msgstr "客户端规则"
 
-# Used in: overview.js:85
-msgid "MAC Address"
-msgstr "MAC地址(主机名)"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:251
+msgid "Rule %d (%s–%s) already covers this whole period, so this rule never adds blocking. Click here to highlight it."
+msgstr "第 %d 条规则（%s–%s）已完整覆盖该时段，本规则不会额外拦截。点击此处可高亮该规则。"
 
-# Used in: overview.js:95
-msgid "Start Time"
-msgstr "开始时间"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:336
+msgid "Chain exists (no rules)"
+msgstr "链已存在（无规则）"
 
-# Used in: overview.js:105
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:358
+msgid "Checking..."
+msgstr "检查中..."
+
+#: root/usr/share/luci/menu.d/luci-app-accesscontrol.json:3
+msgid "Control"
+msgstr "控制"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:357
+msgid "Control internet access for specific devices based on time schedules and MAC addresses."
+msgstr "基于时间计划和MAC地址控制特定设备的互联网访问"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:145
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:145
+msgid "Enable"
+msgstr "启用"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:419
 msgid "End Time"
 msgstr "结束时间"
 
-# Used in: overview.js:101, overview.js:111
-msgid "Invalid time format. Use HH:MM (24-hour format)"
-msgstr "时间格式无效。请使用 HH:MM (24小时制)"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:436
+msgid "For this rule, holiday mode and weekday selection are mutually exclusive. Chinese working days replace the selected weekdays: ordinary weekends and holidays are unrestricted; make-up working days are restricted. This rule's times and MAC address still apply. Weekday edits are saved even when holiday mode hides them; turning holiday mode off restores these selections."
+msgstr "本规则的“按节假日”模式与星期选择互斥，按中国实际工作日替代已勾选的星期：普通周末和节假日放行，调休补班日限制。仍使用本规则的时间段和 MAC 地址。本次星期编辑即使因开启“按节假日”而隐藏，也会保存；取消后恢复这些选择。"
 
-# Used in: overview.js:117
-msgid "Monday"
-msgstr "周一"
-
-# Used in: overview.js:118
-msgid "Tuesday"
-msgstr "周二"
-
-# Used in: overview.js:119
-msgid "Wednesday"
-msgstr "周三"
-
-# Used in: overview.js:120
-msgid "Thursday"
-msgstr "周四"
-
-# Used in: overview.js:121
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:437
 msgid "Friday"
 msgstr "周五"
 
-# Used in: overview.js:122
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:371
+msgid "Global Settings"
+msgstr "全局设置"
+
+#: root/usr/share/rpcd/acl.d/luci-app-accesscontrol.json:3
+msgid "Grant UCI access for luci-app-accesscontrol"
+msgstr "授予 luci-app-accesscontrol 的 UCI 访问权限"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:84
+msgid "Holiday calendar ready."
+msgstr "节假日日历已就绪。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:90
+msgid "Holiday calendar rules could not be applied. Previous rules are retained while retrying."
+msgstr "日历规则应用失败，原规则保留，正在重试。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:93
+msgid "Holiday calendar status could not be read."
+msgstr "无法读取节假日日历状态。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:93
+msgid "Holiday calendar status could not be read. Refresh the page or log in again."
+msgstr "无法读取节假日日历状态。请刷新页面或重新登录。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:81
+msgid "Holiday calendar status is not available yet. Save & Apply to start the holiday service; if it stays empty, check the system log."
+msgstr "节假日日历状态尚未生成。请先“保存并应用”启动节假日服务；若仍为空，请查看系统日志。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:87
+msgid "Holiday calendar unavailable. Using the rules' selected weekdays until calendar data is ready."
+msgstr "节假日数据未就绪，暂时沿用各规则原有的星期选择，待日历数据就绪后自动切换。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:437
+msgid "Holiday mode dates each part of a period by the day it belongs to: a part crossing midnight follows its end date, and a part from 18:00 on follows the next day, so the night before a holiday stays open and the last holiday night is restricted. A period that reaches 18:00 is split at that boundary. For example 20:10–08:00 and 21:30–22:00 are both unrestricted on an ordinary Friday night and restricted on the last holiday night, while 17:00–18:30 keeps 17:00–18:00 on the current day and follows the next day from 18:00."
+msgstr "在“按节假日”模式下，时段按各段所属的日期判定：跨午夜的部分按结束日期，18:00 起的部分按次日，因此假日前一晚放行、假期最后一晚限制；跨越 18:00 的时段会在该分界处自动拆开。例如 20:10–08:00 和 21:30–22:00 在普通周五晚都放行、在假期最后一晚都限制，而 17:00–18:30 的 17:00–18:00 按当天、18:00 之后按次日。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:438
+msgid "Holiday mode follows the router's own timezone from System → Timezone for both the period times and the holiday dates, so a China holiday calendar needs the router set to a UTC+8 zone."
+msgstr "在“按节假日”模式下，时段时间和节假日日期都按路由器自身时区判定（“系统 → 时区”）；要与中国节假历一致，请把路由器时区设为东八区。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:439
+msgid "Holiday mode includes the entire end minute: an end time of 06:00 remains restricted through 06:00:59 and releases at 06:01. Equal start and end times restrict only that minute."
+msgstr "“按节假日”模式包含结束时间所在的整分钟：结束时间为 06:00 时，限制持续到 06:00:59，06:01 解除。开始和结束时间相同时，仅限制该分钟。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:440
+msgid "If calendar data is unavailable, this rule uses its selected weekdays. If calendar rules cannot be applied, the previous rules remain in place while the service retries."
+msgstr "日历数据未就绪时，本规则沿用已勾选的星期；日历规则应用失败时，保留原规则并自动重试。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:355
+#: root/usr/share/luci/menu.d/luci-app-accesscontrol.json:10
+msgid "Internet Access Schedule Control"
+msgstr "上网时间控制"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:415
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:415
+msgid "Invalid time format. Use HH:MM (24-hour format)"
+msgstr "时间格式无效。请使用 HH:MM (24小时制)"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:397
+msgid "MAC Address"
+msgstr "MAC地址(主机名)"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:445
+msgid "Monday"
+msgstr "周一"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:338
+msgid "Not running"
+msgstr "未运行"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:28
+msgid "Option \"%s\" contains an invalid input value."
+msgstr "选项“%s”包含无效输入值。"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:430
+msgid "Respect holidays"
+msgstr "按节假日"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:334
+msgid "Running (nftables)"
+msgstr "运行中（nftables）"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:450
 msgid "Saturday"
 msgstr "周六"
 
-# Used in: overview.js:123
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:408
+msgid "Start Time"
+msgstr "开始时间"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:451
 msgid "Sunday"
 msgstr "周日"
 
-# Used in: menu.d/luci-app-accesscontrol.json
-msgid "Control"
-msgstr "控制"
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:448
+msgid "Thursday"
+msgstr "周四"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:446
+msgid "Tuesday"
+msgstr "周二"
+
+#: htdocs/luci-static/resources/view/accesscontrol/overview.js:447
+msgid "Wednesday"
+msgstr "周三"
